@@ -30,32 +30,24 @@ def is_numeric_series(s: pd.Series) -> bool:
         return False
 
 def normalize_cols(cols):
-    """Return list of clean string column names."""
     out = []
     for c in cols:
         s = "" if c is None else str(c)
-        s = " ".join(s.strip().split())  # strip + collapse inner spaces
+        s = " ".join(s.strip().split())
         out.append(s)
     return out
 
 def resolve_col(selection: str, columns: list[str]) -> str | None:
-    """
-    Map a UI selection to an actual column in 'columns',
-    robust to spaces/casing.
-    """
     if selection is None:
         return None
     columns_norm = normalize_cols(columns)
     sel_norm = " ".join(str(selection).strip().split())
-    # exact
     if sel_norm in columns_norm:
         return columns[columns_norm.index(sel_norm)]
-    # case-insensitive
     sel_cf = sel_norm.casefold()
     for i, c in enumerate(columns_norm):
         if c.casefold() == sel_cf:
             return columns[i]
-    # compact (ignore spaces)
     sel_compact = "".join(sel_norm.split()).casefold()
     for i, c in enumerate(columns_norm):
         if "".join(c.split()).casefold() == sel_compact:
@@ -92,7 +84,6 @@ def black_scholes(S, K, r, sigma, T, option_type="call"):
 # VaR helpers (PERCENT, horizon-aware)
 # ----------------------------
 def _rolling_compounded(returns: pd.Series, window_days: int) -> np.ndarray:
-    """Compounded simple returns over rolling window; returns array of horizon returns."""
     r = pd.Series(returns).dropna().astype(float)
     if r.empty:
         return np.array([])
@@ -102,22 +93,15 @@ def _rolling_compounded(returns: pd.Series, window_days: int) -> np.ndarray:
     return comp.dropna().values
 
 def hist_var_pct(returns, conf=0.95, horizon_days=1):
-    """
-    Historical VaR as POSITIVE LOSS PERCENT over horizon_days.
-    VaR% = -quantile_{1-conf}(horizon return distribution)
-    """
+    """Historical VaR% as positive loss over horizon; uses left-tail (1-conf)."""
     horizon_rets = _rolling_compounded(pd.Series(returns), max(1, int(horizon_days)))
     if horizon_rets.size == 0:
         return np.nan
-    q = np.percentile(horizon_rets, (1 - conf) * 100.0)
-    return max(0.0, -q)
+    q_left = np.percentile(horizon_rets, (1 - conf) * 100.0)
+    return max(0.0, -q_left)
 
 def parametric_var_pct(returns, conf=0.95, horizon_days=1):
-    """
-    Parametric VaR (Normal) as POSITIVE LOSS PERCENT over horizon_days.
-    Uses mean_daily, std_daily scaled: mu_H = mu_d*n, sig_H = sig_d*sqrt(n)
-    VaR% = -(mu_H + sig_H * z_{1-conf})
-    """
+    """Parametric VaR% (Normal) as positive loss; mu*n, sigma*sqrt(n); left-tail (1-conf)."""
     r = pd.Series(returns).dropna().astype(float).values
     if r.size == 0:
         return np.nan
@@ -127,14 +111,13 @@ def parametric_var_pct(returns, conf=0.95, horizon_days=1):
         return np.nan
     mu_H = mu_d * n
     sig_H = sig_d * np.sqrt(n)
-    q = mu_H + sig_H * sps.norm.ppf(1 - conf)  # left-tail quantile
-    return max(0.0, -q)
+    q_left = mu_H + sig_H * sps.norm.ppf(1 - conf)
+    return max(0.0, -q_left)
 
 def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=None):
     """
-    Monte Carlo VaR using DAILY LOG-RETURN calibration.
-    Simulate horizon_days using one-step lognormal with log-mean/vol scaled to horizon.
-    VaR% = -quantile_{1-conf}(simulated horizon return)
+    Monte Carlo VaR% using DAILY LOG-RETURN calibration.
+    VaR% = -quantile_{1-conf}(simulated horizon return).
     """
     r = pd.Series(returns).dropna().astype(float).values
     if r.size == 0 or n < 100:
@@ -148,8 +131,8 @@ def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=No
     mu_H = mu_log_d * H
     sig_H = sig_log_d * np.sqrt(H)
     sims = np.exp(mu_H + sig_H * np.random.randn(int(n))) - 1.0
-    q = np.percentile(sims, (1 - conf) * 100.0)
-    return max(0.0, -q)
+    q_left = np.percentile(sims, (1 - conf) * 100.0)  # ← uses slider conf
+    return max(0.0, -q_left)
 
 # ----------------------------
 # App
@@ -195,7 +178,7 @@ asset_name = st.sidebar.text_input("Display name: Asset", value=default_name_ass
 bench_name_default = "Benchmark" if bench_price_sel != "<None>" else ""
 bench_name = st.sidebar.text_input("Display name: Benchmark", value=bench_name_default)
 
-# ---- Resolve selections against CURRENT dataframe columns ----
+# ---- Resolve selections ----
 date_col = resolve_col(date_sel, raw_cols)
 asset_price_col = resolve_col(asset_price_sel, raw_cols)
 benchmark_price_col = None if bench_price_sel == "<None>" else resolve_col(bench_price_sel, raw_cols)
@@ -206,8 +189,7 @@ missing = []
 if date_col is None: missing.append("Date")
 if asset_price_col is None: missing.append("Asset Price")
 if missing:
-    st.error(f"Could not resolve required column(s): {', '.join(missing)}. "
-             f"Please re-map in the sidebar. (Tip: check for trailing spaces/case.)")
+    st.error(f"Could not resolve required column(s): {', '.join(missing)}. Please re-map in the sidebar.")
     st.stop()
 if bench_price_sel != "<None>" and benchmark_price_col is None:
     st.error("Benchmark Price column could not be resolved. Please re-map.")
@@ -224,7 +206,7 @@ df = raw.copy()
 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True).set_index(date_col)
 
-# ---- Sidebar filters ----
+# ---- Sidebar filters & params ----
 st.sidebar.header("Filters")
 min_d, max_d = df.index.min(), df.index.max()
 date_range = st.sidebar.date_input("Select Date Range", [min_d, max_d])
@@ -248,27 +230,14 @@ conf = st.sidebar.select_slider("VaR Confidence Level", options=[0.90, 0.95, 0.9
 # ---- Normalize to logical names (ndf) ----
 ndf = pd.DataFrame(index=df.index)
 
-# Asset price/returns
-try:
-    ndf["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
-except KeyError:
-    st.error(f"Selected Asset Price column '{asset_price_sel}' not present after sheet load. "
-             f"Please re-map in the sidebar.")
-    st.stop()
-
+ndf["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
 if asset_ret_col is not None:
     ndf["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
 else:
     ndf["Asset_Return"] = ndf["Asset_Price"].pct_change()
 
-# Benchmark (optional)
 if benchmark_price_col is not None:
-    try:
-        ndf["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
-    except KeyError:
-        st.error(f"Selected Benchmark Price column '{bench_price_sel}' not present after sheet load. "
-                 f"Please re-map in the sidebar.")
-        st.stop()
+    ndf["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
     if benchmark_ret_col is not None:
         ndf["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
     else:
@@ -326,7 +295,6 @@ sharpe = np.sqrt(252.0) * safe_div(safe_mean(excess), safe_std(excess))
 sortino = np.sqrt(252.0) * safe_div(safe_mean(excess), safe_std(downside))
 st.write(f"**Sharpe Ratio ({asset_name}):** {sharpe:.3f} | **Sortino Ratio:** {sortino:.3f}")
 
-# Alpha/Beta if benchmark present
 if ndf["Bench_Return"].notna().sum() > 5:
     reg_df = ndf[["Asset_Return", "Bench_Return"]].dropna()
     if not reg_df.empty and reg_df["Bench_Return"].nunique() > 1:
@@ -347,26 +315,25 @@ else:
     st.info("No benchmark selected/provided → skipping Alpha/Beta.")
 
 # ==========================
-# 3) VaR (Asset) — PERCENT ONLY, horizon-aware
+# 3) VaR (Asset) — Percent ONLY, horizon-aware
 # ==========================
 st.header("3️⃣ Value at Risk (VaR) — Percent Loss (no amounts)")
 
-# Horizon in trading days
-h_days = max(1, int(round(252 * float(time_horizon))))
+h_days = max(1, int(round(252 * float(time_horizon))))  # horizon in trading days
 
 hist_var_percent = hist_var_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
 para_var_percent = parametric_var_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
 mc_var_percent   = mc_var_pct_from_returns(ndf["Asset_Return"], conf=conf, horizon_days=h_days, n=10000)
 
-st.caption(f"Holding period: {h_days} trading day(s) | Confidence: {int(conf*100)}%")
+st.caption(f"Left-tail quantile used = (1 − Confidence). Holding period: {h_days} day(s). Confidence: {int(conf*100)}%")
 st.write(f"**Historical VaR (loss):** {hist_var_percent:.2%}")
 st.write(f"**Parametric VaR (loss):** {para_var_percent:.2%}")
 st.write(f"**Monte Carlo VaR (loss):** {mc_var_percent:.2%}")
 
 # ==========================
-# 4) Options & Greeks
+# 4) Black–Scholes Calculation
 # ==========================
-st.header("4️⃣ Options & Greeks")
+st.header("4️⃣ Black–Scholes Calculation")
 col1, col2 = st.columns(2)
 with col1:
     last_price = ndf["Asset_Price"].dropna().iloc[-1] if ndf["Asset_Price"].dropna().size else 100.0
@@ -431,7 +398,6 @@ with tab_direct:
     with c3: st.metric("Δy", f"{dy:.4%}");               st.metric("Equity Shock (%)", f"{shock_pct:.2f}%" if not np.isnan(shock_pct) else "—")
     st.write(f"**ΔE (amount):** {dE_total:,.2f} | **Linear:** {0.0 if np.isnan(dE_linear) else dE_linear:,.2f} | **Convexity:** {dE_conv:,.2f}")
 
-    # ΔEVE sweep
     st.subheader("ΔEVE Sensitivity: Equity Shock vs Yield Shift")
     step_bps = st.select_slider("Shock grid resolution (bps)", options=[10, 25, 50, 100], value=25)
     shocks_bps = np.arange(-300, 300 + step_bps, step_bps, dtype=int)
@@ -495,7 +461,7 @@ with tab_csv:
             st.info("CSV must include columns: Type, Amount. (Optional: Midpoint_Years).")
 
 # ==========================
-# 6) Portfolio Simulation (unchanged view)
+# 6) Portfolio Simulation (Monte Carlo, left-tail matches slider)
 # ==========================
 st.header("6️⃣ Portfolio Simulation")
 
@@ -510,23 +476,30 @@ else:
     if seed_on:
         seed_val = st.number_input("Seed", min_value=0, value=42, step=1)
         np.random.seed(int(seed_val))
+
+    # GBM with daily log-return calibration
     dt = 1.0 / 252.0
     drift = (mu_daily - 0.5 * (sig_daily ** 2)) * dt
     diff  = sig_daily * np.sqrt(dt)
     Z = np.random.randn(n_sims, steps_y)
     log_growth = drift * steps_y + diff * Z.sum(axis=1)
     term_returns = np.exp(log_growth) - 1.0
+
+    # VaR at left-tail (1 - conf), per slider
+    var_left = np.percentile(term_returns, (1 - conf) * 100.0)
+
     prob_loss = float((term_returns < 0).mean())
     mean_ret  = float(np.mean(term_returns))
     p5, p50, p95 = np.percentile(term_returns, [5, 50, 95])
-    var_horizon = np.percentile(term_returns, (1 - conf) * 100)
+
     sim_df = pd.DataFrame({"Terminal Return": term_returns})
     fig3 = px.histogram(sim_df, x="Terminal Return", nbins=60,
-                        title=f"Monte Carlo Terminal Return Distribution ({asset_name}, Horizon = {time_horizon:.2f} years, {n_sims} paths)")
-    fig3.add_vline(x=float(var_horizon), line_dash="dash", line_color="red",
-                   annotation_text=f"VaR {int(conf*100)}%", annotation_position="top right")
+                        title=f"Monte Carlo Terminal Return Distribution (Horizon = {time_horizon:.2f} yrs, {n_sims} paths)")
+    fig3.add_vline(x=float(var_left), line_dash="dash", line_color="red",
+                   annotation_text=f"Left-tail {(1 - conf):.0%}", annotation_position="top right")
     st.plotly_chart(fig3, use_container_width=True)
-    st.write(f"**Confidence:** {int(conf*100)}%")
+
+    st.caption(f"Monte Carlo left-tail quantile uses (1 − Confidence). Confidence: {int(conf*100)}% → Left tail: {(1-conf):.0%}")
     st.write(f"**Probability of Loss over horizon:** {prob_loss:.2%}")
     st.write(f"**Mean Terminal Return:** {mean_ret:.2%} | **Median:** {p50:.2%} | **5th pct:** {p5:.2%} | **95th pct:** {p95:.2%}")
 
