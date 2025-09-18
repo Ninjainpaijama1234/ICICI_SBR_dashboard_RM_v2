@@ -72,12 +72,12 @@ def clamp_pct(x):
     return float(np.minimum(1.0, np.maximum(0.0, x)))
 
 def detect_return_scale(r: pd.Series) -> bool:
+    """Heuristic: True if returns look like percent units (1.2 = 1.2%)."""
     r = pd.to_numeric(pd.Series(r).dropna(), errors="coerce")
     if r.empty:
         return False
     med_abs = float(np.median(np.abs(r)))
     max_abs = float(np.max(np.abs(r)))
-    # looks like % units (e.g., 1.2 = 1.2%)
     if (0.5 <= med_abs <= 100) or (2 < max_abs < 200):
         return True
     return False
@@ -85,17 +85,46 @@ def detect_return_scale(r: pd.Series) -> bool:
 def reset_with_date(frame: pd.DataFrame) -> pd.DataFrame:
     """Robustly create a 'Date' column from the index or first datetime-like column."""
     tmp = frame.reset_index()
-    # If an existing datetime col is present, use the leftmost
     dt_candidates = [c for c in tmp.columns if pd.api.types.is_datetime64_any_dtype(tmp[c])]
     if dt_candidates:
         dcol = dt_candidates[0]
     else:
-        # Fall back to the leftmost column; coerce to datetime
         dcol = tmp.columns[0]
         tmp[dcol] = pd.to_datetime(tmp[dcol], errors="coerce")
     if dcol != "Date":
         tmp = tmp.rename(columns={dcol: "Date"})
     return tmp
+
+def guess_date_col(df: pd.DataFrame) -> str:
+    """Pick the best date column by heuristics and dtype."""
+    for c in df.columns:
+        if 'date' in c.lower():
+            return c
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            return c
+    best_c, best_score = None, -1
+    for c in df.columns:
+        s = pd.to_datetime(df[c], errors="coerce")
+        score = s.notna().sum()
+        if score > best_score:
+            best_c, best_score = c, score
+    return best_c or df.columns[0]
+
+def guess_price_col(cols):
+    """Heuristic: pick common price column names from a list of column names."""
+    prefer = ["adj close", "adj_close", "close", "close price", "price", "last", "px_last"]
+    low = [c.lower() for c in cols]
+    for name in prefer:
+        if name in low:
+            return cols[low.index(name)]
+    return None
+
+def first_numeric(cols, df):
+    for c in cols:
+        if is_numeric_series(df[c]):
+            return c
+    return None
 
 # ======================================
 # Black–Scholes
@@ -124,7 +153,7 @@ def black_scholes(S, K, r, sigma, T, option_type="call"):
         return (np.nan,)*6
 
 # ======================================
-# VaR helpers (percent; horizon-aware)
+# VaR / ES helpers (percent; horizon-aware)
 # ======================================
 def _rolling_compounded(returns: pd.Series, window_days: int) -> np.ndarray:
     r = pd.Series(returns).dropna().astype(float)
@@ -136,13 +165,30 @@ def _rolling_compounded(returns: pd.Series, window_days: int) -> np.ndarray:
     return comp.dropna().values
 
 def hist_var_pct(returns, conf=0.95, horizon_days=1):
+    """Historical VaR% as positive loss over horizon; left-tail (1-conf)."""
     horizon_rets = _rolling_compounded(pd.Series(returns), max(1, int(horizon_days)))
     if horizon_rets.size == 0:
         return np.nan
     q_left = np.percentile(horizon_rets, (1 - conf) * 100.0)
     return max(0.0, -q_left)
 
+def hist_es_pct(returns, conf=0.95, horizon_days=1):
+    """Historical ES% (average loss in worst (1-conf) tail) over horizon."""
+    rr = _rolling_compounded(pd.Series(returns), max(1, int(horizon_days)))
+    if rr.size == 0:
+        return np.nan
+    q = np.percentile(rr, (1 - conf) * 100.0)
+    tail = rr[rr <= q]
+    if tail.size == 0:
+        return np.nan
+    es = -np.mean(tail)
+    return max(0.0, es)
+
 def parametric_var_pct_lognormal(returns, conf=0.95, horizon_days=1):
+    """
+    Parametric VaR% assuming lognormal prices (log-returns ~ Normal).
+    VaR% = -[exp(mu_log*H + sigma_log*sqrt(H)*z_{1-conf}) - 1]
+    """
     r = pd.Series(returns).dropna().astype(float).values
     if r.size == 0:
         return np.nan
@@ -154,7 +200,32 @@ def parametric_var_pct_lognormal(returns, conf=0.95, horizon_days=1):
     q = np.exp(mu_log_d * H + sig_log_d * np.sqrt(H) * z) - 1.0
     return max(0.0, -q)
 
+def parametric_es_pct_lognormal(returns, conf=0.95, horizon_days=1, n=50000, seed=123):
+    """
+    Parametric ES% under lognormal model for prices (log-returns ~ Normal).
+    Computed via simulation for robustness.
+    """
+    r = pd.Series(returns).dropna().astype(float).values
+    if r.size == 0:
+        return np.nan
+    if seed is not None:
+        np.random.seed(int(seed))
+    log_r = np.log1p(r)
+    mu_log_d = float(np.nanmean(log_r))
+    sig_log_d = float(np.nanstd(log_r, ddof=1))
+    H = max(1, int(horizon_days))
+    sims = np.exp(mu_log_d * H + sig_log_d * np.sqrt(H) * np.random.randn(int(n))) - 1.0
+    q = np.percentile(sims, (1 - conf) * 100.0)
+    tail = sims[sims <= q]
+    if tail.size == 0:
+        return np.nan
+    es = -float(np.mean(tail))
+    return max(0.0, es)
+
 def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=None):
+    """
+    Monte Carlo VaR% using daily log-return calibration (same calibration as parametric).
+    """
     r = pd.Series(returns).dropna().astype(float).values
     if r.size == 0 or n < 100:
         return np.nan
@@ -167,6 +238,25 @@ def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=No
     sims = np.exp(mu_log_d * H + sig_log_d * np.sqrt(H) * np.random.randn(int(n))) - 1.0
     q_left = np.percentile(sims, (1 - conf) * 100.0)
     return max(0.0, -q_left)
+
+def mc_es_pct_from_returns(returns, conf=0.95, horizon_days=1, n=50000, seed=123):
+    """Monte Carlo ES% using the same empirical calibration as MC VaR."""
+    r = pd.Series(returns).dropna().astype(float).values
+    if r.size == 0 or n < 100:
+        return np.nan
+    if seed is not None:
+        np.random.seed(int(seed))
+    log_r = np.log1p(r)
+    mu_log_d = float(np.nanmean(log_r))
+    sig_log_d = float(np.nanstd(log_r, ddof=1))
+    H = max(1, int(horizon_days))
+    sims = np.exp(mu_log_d * H + sig_log_d * np.sqrt(H) * np.random.randn(int(n))) - 1.0
+    q = np.percentile(sims, (1 - conf) * 100.0)
+    tail = sims[sims <= q]
+    if tail.size == 0:
+        return np.nan
+    es = -float(np.mean(tail))
+    return max(0.0, es)
 
 # ======================================
 # App
@@ -195,13 +285,23 @@ else:
 raw.columns = normalize_cols(raw.columns)
 raw_cols = list(raw.columns)
 
-# ---------- Column mapping ----------
-date_guess = next((c for c in raw_cols if "date" in c.lower()), raw_cols[0])
-numeric_cols = [c for c in raw_cols if is_numeric_series(raw[c])]
-if not numeric_cols:
-    st.error("No numeric columns detected. Please upload a sheet with price/return numerics.")
-    st.stop()
+# ---------- Column Inspector ----------
+with st.expander("🔎 Column Inspector"):
+    st.write("**Detected columns:**", raw_cols)
+    st.dataframe(raw.head(10), use_container_width=True)
 
+# ---------- Heuristic guesses ----------
+date_guess = guess_date_col(raw)
+numeric_cols = [c for c in raw_cols if is_numeric_series(raw[c])]
+price_guess = guess_price_col(numeric_cols) or (first_numeric(numeric_cols, raw))
+bench_guess = None
+if price_guess and len(numeric_cols) > 1:
+    others = [c for c in numeric_cols if c != price_guess]
+    bench_guess = guess_price_col(others) or (others[0] if others else None)
+ret_guess = next((c for c in raw_cols if 'return' in c.lower() or '%' in c.lower()), "<None>")
+bench_ret_guess = "<None>"
+
+# ---------- Column mapping (per-file keys to avoid sticky state) ----------
 st.sidebar.header("🔧 Column Mapping")
 date_sel = st.sidebar.selectbox("Date column",
                                 options=raw_cols,
@@ -209,19 +309,29 @@ date_sel = st.sidebar.selectbox("Date column",
                                 key=file_scope_key("date_col", uploaded_file))
 asset_price_sel = st.sidebar.selectbox("Asset Price column",
                                        options=numeric_cols,
-                                       index=0,
+                                       index=(numeric_cols.index(price_guess) if price_guess in numeric_cols else 0),
                                        key=file_scope_key("asset_price_col", uploaded_file))
+bench_price_options = ["<None>"] + numeric_cols
+bench_default_idx = 0
+if bench_guess and bench_guess in numeric_cols:
+    bench_default_idx = bench_price_options.index(bench_guess) if bench_guess in bench_price_options else 0
 bench_price_sel = st.sidebar.selectbox("Benchmark Price column (optional)",
-                                       options=["<None>"] + numeric_cols,
-                                       index=0,
+                                       options=bench_price_options,
+                                       index=bench_default_idx,
                                        key=file_scope_key("bench_price_col", uploaded_file))
+
+asset_ret_options = ["<None>"] + raw_cols
+asset_ret_default_idx = (asset_ret_options.index(ret_guess) if ret_guess in asset_ret_options else 0)
 asset_ret_sel = st.sidebar.selectbox("Asset Return column (optional)",
-                                     options=["<None>"] + numeric_cols,
-                                     index=0,
+                                     options=asset_ret_options,
+                                     index=asset_ret_default_idx,
                                      key=file_scope_key("asset_ret_col", uploaded_file))
+
+bench_ret_options = ["<None>"] + raw_cols
+bench_ret_default_idx = (bench_ret_options.index(bench_ret_guess) if bench_ret_guess in bench_ret_options else 0)
 bench_ret_sel = st.sidebar.selectbox("Benchmark Return column (optional)",
-                                     options=["<None>"] + numeric_cols,
-                                     index=0,
+                                     options=bench_ret_options,
+                                     index=bench_ret_default_idx,
                                      key=file_scope_key("bench_ret_col", uploaded_file))
 
 asset_name = st.sidebar.text_input("Display name: Asset",
@@ -240,7 +350,6 @@ asset_ret_col = None if asset_ret_sel == "<None>" else resolve_col(asset_ret_sel
 benchmark_ret_col = None if bench_ret_sel == "<None>" else resolve_col(bench_ret_sel, raw_cols)
 
 # ---------- Build indexed frame ----------
-# Validate presence BEFORE using
 assert_in_df(raw, date_col, "Date")
 assert_in_df(raw, asset_price_col, "Asset Price")
 if benchmark_price_col is not None:
@@ -297,9 +406,9 @@ else:
 auto_pct = detect_return_scale(ndf["Asset_Return"])
 with st.sidebar.expander("Return Scaling (if uploaded returns are % units)"):
     st.write("If return column uses % units (e.g., 1.2 = 1.2%), enable scaling.")
-    force_pct = st.checkbox("Treat Asset Return column as % (divide by 100)",
-                            value=auto_pct,
-                            key=file_scope_key("asset_pct_flag", uploaded_file))
+    st.checkbox("Treat Asset Return column as % (divide by 100)",
+                value=auto_pct,
+                key=file_scope_key("asset_pct_flag", uploaded_file))
 if st.session_state.get(file_scope_key("asset_pct_flag", uploaded_file), False):
     ndf["Asset_Return"] = ndf["Asset_Return"] / 100.0
 
@@ -343,7 +452,7 @@ fig1 = px.line(
 )
 for tr in fig1.data:
     tr.name = rename_map.get(tr.name, tr.name)
-st.plotly_chart(fig1, width='stretch')
+st.plotly_chart(fig1, use_container_width=True)
 
 cum_df = pd.DataFrame({"Date": df_reset["Date"]})
 cum_df[f"{asset_name}_CumRet"] = (1 + ndf["Asset_Return"].fillna(0)).cumprod().values - 1
@@ -356,7 +465,7 @@ fig_cum = px.line(
     y=[c for c in cum_df.columns if c.endswith("_CumRet")],
     title="Cumulative Returns"
 )
-st.plotly_chart(fig_cum, width='stretch')
+st.plotly_chart(fig_cum, use_container_width=True)
 
 stats_cols = ["Asset_Return"] + (["Bench_Return"] if ndf["Bench_Return"].notna().any() else [])
 stats_tbl = ndf[stats_cols].agg(["mean", "var", "std"]).rename(
@@ -405,7 +514,7 @@ if ndf["Bench_Return"].notna().sum() > 5:
                 trendline="ols",
                 title=f"Regression: {asset_name} vs {bench_name or 'Benchmark'} (daily returns)"
             )
-            st.plotly_chart(fig2, width='stretch')
+            st.plotly_chart(fig2, use_container_width=True)
         except Exception as e:
             st.warning(f"Regression failed: {e}")
     else:
@@ -414,23 +523,50 @@ else:
     st.info("No benchmark selected/provided → skipping Alpha/Beta.")
 
 # ======================================
-# 3) VaR — Percent Loss (no amounts)
+# 3) VaR — Percent Loss + ES (no amounts)
 # ======================================
-st.header("3️⃣ Value at Risk (VaR) — Percent Loss")
+st.header("3️⃣ Value at Risk (VaR) — Percent Loss (no amounts) + Expected Shortfall (ES)")
 
 h_days = max(1, int(round(252 * float(time_horizon))))
+
+# VaR %
 hist_var_percent = hist_var_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
 para_var_percent = parametric_var_pct_lognormal(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
 mc_var_percent   = mc_var_pct_from_returns(ndf["Asset_Return"], conf=conf, horizon_days=h_days, n=10000)
 
+# ES %
+hist_es_percent  = hist_es_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
+para_es_percent  = parametric_es_pct_lognormal(ndf["Asset_Return"], conf=conf, horizon_days=h_days, n=50000, seed=123)
+mc_es_percent    = mc_es_pct_from_returns(ndf["Asset_Return"], conf=conf, horizon_days=h_days, n=50000, seed=123)
+
+# Clamp to [0,1] for display sanity
 hist_var_percent = clamp_pct(hist_var_percent)
 para_var_percent = clamp_pct(para_var_percent)
 mc_var_percent   = clamp_pct(mc_var_percent)
+hist_es_percent  = clamp_pct(hist_es_percent)
+para_es_percent  = clamp_pct(para_es_percent)
+mc_es_percent    = clamp_pct(mc_es_percent)
 
-st.caption(f"Left-tail quantile = (1 − Confidence). Holding period: {h_days} day(s). Confidence: {int(conf*100)}%")
-st.write(f"**Historical VaR (loss):** {hist_var_percent:.2%}")
-st.write(f"**Parametric VaR (loss) [lognormal]:** {para_var_percent:.2%}")
-st.write(f"**Monte Carlo VaR (loss):** {mc_var_percent:.2%}")
+left_tail = 1 - conf
+st.caption(
+    f"At **{int(conf*100)}% confidence** over **{h_days} trading day(s)**, "
+    f"there is a **{left_tail:.0%}** chance the loss is **at least VaR**. "
+    f"**ES (CVaR)** is the **average loss** conditional on being in that worst {left_tail:.0%}."
+)
+
+colA, colB, colC = st.columns(3)
+with colA:
+    st.markdown("**Historical**")
+    st.write(f"VaR (loss): {hist_var_percent:.2%}")
+    st.write(f"ES  (loss): {hist_es_percent:.2%}")
+with colB:
+    st.markdown("**Parametric (lognormal)**")
+    st.write(f"VaR (loss): {para_var_percent:.2%}")
+    st.write(f"ES  (loss): {para_es_percent:.2%}")
+with colC:
+    st.markdown("**Monte Carlo**")
+    st.write(f"VaR (loss): {mc_var_percent:.2%}")
+    st.write(f"ES  (loss): {mc_es_percent:.2%}")
 
 # ======================================
 # 4) Black–Scholes Calculation
@@ -525,7 +661,7 @@ with tab_direct:
         fig_sens = px.line(sens_df, x="Shock_bps", y="EquityShock_pct",
                            title="Equity Shock % vs Parallel Yield Shift (bps)")
         fig_sens.update_traces(mode="lines+markers")
-        st.plotly_chart(fig_sens, width='stretch')
+        st.plotly_chart(fig_sens, use_container_width=True)
     else:
         st.info("Provide valid A, L, DA, DL (and ensure A ≠ 0) to run the sensitivity sweep.")
 
@@ -590,10 +726,14 @@ else:
     sig_log_d = float(np.nanstd(log_r, ddof=1))
     term_returns = np.exp(mu_log_d * steps_y + sig_log_d * np.sqrt(steps_y) * np.random.randn(n_sims)) - 1.0
 
-    var_left = np.percentile(term_returns, (1 - conf) * 100.0)
+    var_left = np.percentile(term_returns, (1 - conf) * 100.0)  # (1-conf) left tail
     prob_loss = float((term_returns < 0).mean())
     mean_ret  = float(np.mean(term_returns))
     p5, p50, p95 = np.percentile(term_returns, [5, 50, 95])
+
+    # MC ES aligned to the same horizon/conf
+    mc_es_percent_sim = -float(np.mean(term_returns[term_returns <= var_left])) if np.any(term_returns <= var_left) else np.nan
+    mc_es_percent_sim = clamp_pct(mc_es_percent_sim)
 
     sim_df = pd.DataFrame({"Terminal Return": term_returns})
     fig3 = px.histogram(
@@ -602,11 +742,16 @@ else:
     )
     fig3.add_vline(x=float(var_left), line_dash="dash", line_color="red",
                    annotation_text=f"Left-tail {(1 - conf):.0%}", annotation_position="top right")
-    st.plotly_chart(fig3, width='stretch')
+    st.plotly_chart(fig3, use_container_width=True)
 
     st.caption(f"Monte Carlo left-tail uses (1 − Confidence). Confidence: {int(conf*100)}% → Left tail: {(1-conf):.0%}")
     st.write(f"**Probability of Loss over horizon:** {prob_loss:.2%}")
     st.write(f"**Mean Terminal Return:** {mean_ret:.2%} | **Median:** {p50:.2%} | **5th pct:** {p5:.2%} | **95th pct:** {p95:.2%}")
+    st.info(
+        f"With confidence {int(conf*100)}% over {steps_y} trading day(s), "
+        f"MC **VaR ≈ {abs(var_left):.2%}** (the simulated {int((1-conf)*100)}th percentile), "
+        f"and MC **ES ≈ {mc_es_percent_sim:.2%}** (average of the worst {int((1-conf)*100)}% paths)."
+    )
 
 # ======================================
 # 7) Download
