@@ -26,6 +26,13 @@ def safe_div(a, b):
         return np.nan
     return a / b
 
+def is_numeric_series(s):
+    try:
+        pd.to_numeric(s.dropna().head(5))
+        return True
+    except Exception:
+        return False
+
 # ----------------------------
 # Black-Scholes Option Pricing
 # ----------------------------
@@ -89,25 +96,48 @@ def monte_carlo_var(S0, mu, sigma, T, n=10000, conf=0.95):
 # ----------------------------
 # Streamlit App
 # ----------------------------
-st.set_page_config(page_title="ICICI Risk Dashboard", layout="wide")
-st.title("📊 ICICI Bank Risk & Portfolio Dashboard")
+st.set_page_config(page_title="Risk & Portfolio Dashboard", layout="wide")
+st.title("📊 Risk & Portfolio Dashboard")
 
 # ---- File Upload ----
-uploaded_file = st.file_uploader("Upload ICICI Dashboard Excel", type=["xlsx"])
+uploaded_file = st.file_uploader("Upload Excel (any stock + optional benchmark)", type=["xlsx"])
 if uploaded_file:
-    df = pd.read_excel(uploaded_file)
+    raw = pd.read_excel(uploaded_file)
+    default_name_asset = uploaded_file.name.split(".")[0]
 else:
-    df = pd.read_excel("icici dashboard data.xlsx")
+    # Fallback to your original file name
+    raw = pd.read_excel("icici dashboard data.xlsx")
+    default_name_asset = "ICICI"
 
-# Expecting 5 columns: Date, ICICI_Price, ICICI_Return, Nifty_Price, Nifty_Return
-if df.shape[1] < 5:
-    st.error("Input file must have 5 columns: Date, ICICI_Price, ICICI_Return, Nifty_Price, Nifty_Return")
-    st.stop()
+# Basic cleaning
+raw_cols = list(raw.columns)
+# Try to guess date column
+date_candidates = [c for c in raw_cols if "date" in str(c).lower()]
+date_col_guess = date_candidates[0] if date_candidates else raw_cols[0]
 
-df.columns = ["Date", "ICICI_Price", "ICICI_Return", "Nifty_Price", "Nifty_Return"]
-df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-df = df.set_index("Date")
+# Numeric columns for price/return mapping
+numeric_cols = [c for c in raw_cols if is_numeric_series(raw[c])]
+
+st.sidebar.header("🔧 Column Mapping")
+date_col = st.sidebar.selectbox("Date column", options=raw_cols, index=raw_cols.index(date_col_guess) if date_col_guess in raw_cols else 0)
+
+asset_price_col = st.sidebar.selectbox("Asset Price column", options=numeric_cols, index=0 if numeric_cols else 0)
+# Optional: user may choose no benchmark
+benchmark_price_col = st.sidebar.selectbox("Benchmark Price column (optional)", options=["<None>"] + numeric_cols, index=1 if len(numeric_cols) > 1 else 0)
+
+# Optional pre-computed returns (if your file has them)
+asset_ret_col = st.sidebar.selectbox("Asset Return column (optional)", options=["<None>"] + numeric_cols, index=0)
+benchmark_ret_col = st.sidebar.selectbox("Benchmark Return column (optional)", options=["<None>"] + numeric_cols, index=0)
+
+# Display names
+asset_name = st.sidebar.text_input("Display name: Asset", value=default_name_asset)
+bench_name_default = "Nifty" if benchmark_price_col != "<None>" else ""
+bench_name = st.sidebar.text_input("Display name: Benchmark", value=bench_name_default)
+
+# Convert to time index
+df = raw.copy()
+df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True).set_index(date_col)
 
 # ---- Sidebar Filters & Parameters ----
 st.sidebar.header("Filters")
@@ -128,41 +158,71 @@ notional = st.sidebar.number_input("Notional Value", min_value=0.0, value=10000.
 risk_free = st.sidebar.slider("Risk-Free Rate (%)", 0.0, 10.0, 5.0) / 100.0
 volatility_ui = st.sidebar.slider("Volatility (%)", 0.0, 100.0, 30.0) / 100.0
 time_horizon = st.sidebar.slider("Time Horizon (Years)", 0.1, 5.0, 1.0)
+conf = st.sidebar.select_slider("VaR Confidence Level", options=[0.90, 0.95, 0.99], value=0.95, format_func=lambda x: f"{int(x*100)}%")
 
-# Global VaR confidence
-conf = st.sidebar.select_slider(
-    "VaR Confidence Level",
-    options=[0.90, 0.95, 0.99],
-    value=0.95,
-    format_func=lambda x: f"{int(x*100)}%"
-)
+# Build a normalized frame with logical names
+norm = pd.DataFrame(index=df.index)
+norm["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
+if asset_ret_col != "<None>":
+    norm["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
+else:
+    norm["Asset_Return"] = norm["Asset_Price"].pct_change()
+
+if benchmark_price_col != "<None>":
+    norm["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
+    if benchmark_ret_col != "<None>":
+        norm["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
+    else:
+        norm["Bench_Return"] = norm["Bench_Price"].pct_change()
+else:
+    norm["Bench_Price"] = np.nan
+    norm["Bench_Return"] = np.nan
 
 # ==========================
 # 1. Performance Analysis
 # ==========================
 st.header("1️⃣ Performance Analysis")
 
-icici_ret = pd.to_numeric(df["ICICI_Return"], errors="coerce") if df["ICICI_Return"].notna().any() \
-            else pd.to_numeric(df["ICICI_Price"], errors="coerce").pct_change()
-nifty_ret  = pd.to_numeric(df["Nifty_Return"], errors="coerce") if df["Nifty_Return"].notna().any() \
-            else pd.to_numeric(df["Nifty_Price"], errors="coerce").pct_change()
+# Price chart
+df_reset = norm.reset_index().rename(columns={date_col: "Date"})
+price_cols = ["Asset_Price"] + (["Bench_Price"] if norm["Bench_Price"].notna().any() else [])
+rename_map = {"Asset_Price": asset_name}
+if "Bench_Price" in price_cols:
+    rename_map["Bench_Price"] = bench_name or "Benchmark"
 
-df["ICICI_%Change"] = icici_ret
-df["Nifty_%Change"] = nifty_ret
-
-df_reset = df.reset_index()
-fig1 = px.line(df_reset, x="Date", y=["ICICI_Price", "Nifty_Price"], title="ICICI vs Nifty Prices")
+fig1 = px.line(
+    df_reset,
+    x="index",  # after reset_index, index column is named 'index' if no explicit name on DatetimeIndex
+    y=price_cols,
+    title=(f"{asset_name}" + (f" vs {bench_name}" if "Bench_Price" in price_cols else "") + " — Prices")
+)
+# make sure x is actually the datetime column named "index" after reset; rename it to "Date" for clarity
+df_reset = df_reset.rename(columns={"index": "Date"})
+fig1.update_traces()
+fig1.update_layout(xaxis_title="Date")
+# Relabel series
+for i, series in enumerate(price_cols):
+    fig1.data[i].name = rename_map.get(series, series)
 st.plotly_chart(fig1, use_container_width=True)
 
-cum_df = pd.DataFrame({
-    "Date": df_reset["Date"],
-    "ICICI_CumRet": (1 + df["ICICI_%Change"].fillna(0)).cumprod().values - 1,
-    "Nifty_CumRet":  (1 + df["Nifty_%Change"].fillna(0)).cumprod().values - 1
-})
-fig_cum = px.line(cum_df, x="Date", y=["ICICI_CumRet", "Nifty_CumRet"], title="Cumulative Returns")
+# Cumulative returns
+cum_df = pd.DataFrame({"Date": df_reset["Date"]})
+cum_df[f"{asset_name}_CumRet"] = (1 + norm["Asset_Return"].fillna(0)).cumprod().values - 1
+if norm["Bench_Return"].notna().any():
+    cum_df[f"{bench_name or 'Benchmark'}_CumRet"] = (1 + norm["Bench_Return"].fillna(0)).cumprod().values - 1
+
+fig_cum = px.line(
+    cum_df,
+    x="Date",
+    y=[c for c in cum_df.columns if c.endswith("_CumRet")],
+    title="Cumulative Returns"
+)
 st.plotly_chart(fig_cum, use_container_width=True)
 
-stats_tbl = df[["ICICI_%Change", "Nifty_%Change"]].agg(["mean", "var", "std"])
+# Summary stats
+stats_cols = ["Asset_Return"] + (["Bench_Return"] if norm["Bench_Return"].notna().any() else [])
+stats_tbl = norm[stats_cols].agg(["mean", "var", "std"])
+stats_tbl = stats_tbl.rename(columns={"Asset_Return": asset_name, "Bench_Return": bench_name or "Benchmark"})
 st.write("**Return Stats (daily):**")
 st.dataframe(stats_tbl)
 
@@ -171,50 +231,51 @@ st.dataframe(stats_tbl)
 # ==========================
 st.header("2️⃣ Risk-Return Analysis")
 
+# Sharpe & Sortino for the asset
 rf_daily = risk_free / 252.0
-excess = (df["ICICI_%Change"] - rf_daily).dropna().values
-downside = (df["ICICI_%Change"][df["ICICI_%Change"] < 0] - rf_daily).dropna().values
-
+excess = (norm["Asset_Return"] - rf_daily).dropna().values
+downside = (norm["Asset_Return"][norm["Asset_Return"] < 0] - rf_daily).dropna().values
 excess_mean = safe_mean(excess)
 excess_std = safe_std(excess)
 down_std = safe_std(downside)
-
 sharpe = np.sqrt(252.0) * safe_div(excess_mean, excess_std)
 sortino = np.sqrt(252.0) * safe_div(excess_mean, down_std)
 
-reg_df = df[["ICICI_%Change", "Nifty_%Change"]].dropna()
-alpha = beta = np.nan
-if not reg_df.empty and reg_df["Nifty_%Change"].nunique() > 1:
-    X = add_constant(reg_df["Nifty_%Change"].values.astype(float))
-    y = reg_df["ICICI_%Change"].values.astype(float)
-    try:
-        model = OLS(y, X).fit()
-        params = model.params
-        alpha = float(params[0]); beta = float(params[1])
-    except Exception as e:
-        st.warning(f"Regression failed safely: {e}")
+st.write(f"**Sharpe Ratio ({asset_name}):** {sharpe:.3f} | **Sortino Ratio:** {sortino:.3f}")
 
-st.write(f"**Sharpe Ratio:** {sharpe:.3f} | **Sortino Ratio:** {sortino:.3f}")
-st.write(f"**Alpha:** {alpha:.6f} | **Beta:** {beta:.4f}")
-
-if not reg_df.empty:
-    fig2 = px.scatter(reg_df.reset_index(), x="Nifty_%Change", y="ICICI_%Change",
-                      trendline="ols", title="Regression: ICICI vs Nifty (daily returns)")
-    st.plotly_chart(fig2, use_container_width=True)
+# Beta & Alpha only if benchmark provided
+if norm["Bench_Return"].notna().sum() > 5:
+    reg_df = norm[["Asset_Return", "Bench_Return"]].dropna()
+    if not reg_df.empty and reg_df["Bench_Return"].nunique() > 1:
+        X = add_constant(reg_df["Bench_Return"].values.astype(float))
+        y = reg_df["Asset_Return"].values.astype(float)
+        try:
+            model = OLS(y, X).fit()
+            alpha, beta = float(model.params[0]), float(model.params[1])
+            st.write(f"**Alpha ({asset_name} vs {bench_name or 'Benchmark'}):** {alpha:.6f} | **Beta:** {beta:.4f}")
+            fig2 = px.scatter(reg_df.reset_index(), x="Bench_Return", y="Asset_Return",
+                              trendline="ols", title=f"Regression: {asset_name} vs {bench_name or 'Benchmark'} (daily returns)")
+            st.plotly_chart(fig2, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Regression failed: {e}")
+    else:
+        st.info("Insufficient variability in benchmark returns for regression.")
 else:
-    st.info("Insufficient data for regression plot.")
+    st.info("No benchmark selected/provided → skipping Alpha/Beta.")
 
 # ==========================
 # 3. Value at Risk
 # ==========================
-st.header("3️⃣ Value at Risk (VaR)")
+st.header("3️⃣ Value at Risk (VaR) — on Asset")
 
-hist_var_val = historical_var(df["ICICI_%Change"], conf)
-param_var_val = parametric_var(df["ICICI_%Change"], conf)
+hist_var_val = historical_var(norm["Asset_Return"], conf)
+param_var_val = parametric_var(norm["Asset_Return"], conf)
+# one-step lognormal approximation using last price
+last_price = norm["Asset_Price"].dropna().iloc[-1] if norm["Asset_Price"].dropna().size else np.nan
 mc_var_val = monte_carlo_var(
-    S0=df["ICICI_Price"].dropna().iloc[-1] if df["ICICI_Price"].dropna().size else np.nan,
-    mu=safe_mean(df["ICICI_%Change"]),
-    sigma=safe_std(df["ICICI_%Change"]),
+    S0=last_price,
+    mu=safe_mean(norm["Asset_Return"]),
+    sigma=safe_std(norm["Asset_Return"]),
     T=time_horizon,
     n=10000,
     conf=conf
@@ -236,13 +297,12 @@ if notional and not np.isnan(notional):
 st.header("4️⃣ Options & Greeks")
 col1, col2 = st.columns(2)
 with col1:
-    S = st.number_input("Spot Price", min_value=0.0, value=100.0)
-    K = st.number_input("Strike Price", min_value=0.0, value=100.0)
+    S = st.number_input("Spot Price", min_value=0.0, value=float(last_price) if not np.isnan(last_price) else 100.0)
+    K = st.number_input("Strike Price", min_value=0.0, value=float(last_price) if not np.isnan(last_price) else 100.0)
 with col2:
     sigma_ui = st.number_input("Volatility (σ, decimal)", min_value=0.0, value=0.2)
     T = st.number_input("Time to Maturity (Years)", min_value=0.0, value=1.0)
 opt_type = st.selectbox("Option Type", ["call", "put"])
-
 price, delta, gamma, theta, vega, rho = black_scholes(S, K, risk_free, sigma_ui, T, option_type=opt_type)
 st.write(
     f"**Price:** {price:.4f} | **Delta:** {delta:.4f} | **Gamma:** {gamma:.6f} | "
@@ -301,29 +361,28 @@ with tab_direct:
 
     st.markdown(
         "**Formulas**  \n"
-        "Duration Gap: **DG = DA − DL × (L/A)**  \n"
-        "ΔE (linear): **− DG × A × Δy**  \n"
-        "ΔE (with convexity): **− DG × A × Δy + 0.5 × (CA×A − CL×L) × Δy²**"
+        "DG = DA − DL × (L/A)  \n"
+        "ΔE ≈ − DG × A × Δy  (+ convexity: 0.5 × (CA×A − CL×L) × Δy²)"
     )
 
     m1, m2, m3 = st.columns(3)
     with m1:
         st.metric("Equity E = A − L", f"{E:,.2f}")
-        st.metric("Duration of Assets (DA)", f"{DA:.2f} years")
+        st.metric("DA (years)", f"{DA:.2f}")
     with m2:
-        st.metric("Duration of Liabs (DL)", f"{DL:.2f} years")
+        st.metric("DL (years)", f"{DL:.2f}")
         st.metric("Duration Gap (DG)", f"{DG:.4f}" if not np.isnan(DG) else "—")
     with m3:
-        st.metric("Yield Shock Δy", f"{dy:.4%}")
+        st.metric("Δy", f"{dy:.4%}")
         st.metric("Equity Shock (%)", f"{shock_pct:.2f}%" if not np.isnan(shock_pct) else "—")
 
     st.write(
         f"**ΔE (amount):** {dE_total:,.2f}  |  "
-        f"**Linear component:** {0.0 if np.isnan(dE_linear) else dE_linear:,.2f}  |  "
+        f"**Linear:** {0.0 if np.isnan(dE_linear) else dE_linear:,.2f}  |  "
         f"**Convexity add-on:** {dE_conv:,.2f}"
     )
 
-    # -------- ΔEVE sweep: Equity Shock % vs Δy ----------
+    # ΔEVE Sensitivity sweep
     st.subheader("ΔEVE Sensitivity: Equity Shock vs Yield Shift")
     step_bps = st.select_slider("Shock grid resolution (bps)", options=[10, 25, 50, 100], value=25)
     shocks_bps = np.arange(-300, 300 + step_bps, step_bps, dtype=int)
@@ -342,11 +401,14 @@ with tab_direct:
             "EquityShock_pct": eq_shock_pct_vec
         })
 
-        st.dataframe(sens_df.style.format({
-            "Delta_y": "{:.4%}",
-            "DeltaE_amount": "{:,.2f}",
-            "EquityShock_pct": "{:.2f}"
-        }), use_container_width=True)
+        st.dataframe(
+            sens_df.style.format({
+                "Delta_y": "{:.4%}",
+                "DeltaE_amount": "{:,.2f}",
+                "EquityShock_pct": "{:.2f}"
+            }),
+            use_container_width=True
+        )
 
         fig_sens = px.line(
             sens_df, x="Shock_bps", y="EquityShock_pct",
@@ -401,12 +463,12 @@ with tab_csv:
             st.info("CSV must include columns: Type, Amount. (Optional: Midpoint_Years).")
 
 # ==========================
-# 6. Portfolio Simulation (GBM, horizon-aware)
+# 6. Portfolio Simulation (GBM, horizon-aware) on Asset
 # ==========================
 st.header("6️⃣ Portfolio Simulation")
 
-mu_daily  = safe_mean(df["ICICI_%Change"])
-sig_daily = safe_std(df["ICICI_%Change"])
+mu_daily  = safe_mean(norm["Asset_Return"])
+sig_daily = safe_std(norm["Asset_Return"])
 
 if np.isnan(mu_daily) or np.isnan(sig_daily) or sig_daily < 0:
     st.info("Insufficient data to simulate returns.")
@@ -433,7 +495,7 @@ else:
 
     sim_df = pd.DataFrame({"Terminal Return": term_returns})
     fig3 = px.histogram(sim_df, x="Terminal Return", nbins=60,
-                        title=f"Monte Carlo Terminal Return Distribution (Horizon = {time_horizon:.2f} years, {n_sims} paths)")
+                        title=f"Monte Carlo Terminal Return Distribution ({asset_name}, Horizon = {time_horizon:.2f} years, {n_sims} paths)")
     fig3.add_vline(x=float(var_horizon), line_dash="dash", line_color="red",
                    annotation_text=f"VaR {int(conf*100)}%", annotation_position="top right")
     st.plotly_chart(fig3, use_container_width=True)
@@ -450,11 +512,11 @@ else:
 # ==========================
 st.header("7️⃣ Download Options")
 output = io.BytesIO()
-df_export = df.copy()
-df_export.reset_index().to_excel(output, index=False)
+export_df = norm.copy()
+export_df.reset_index().to_excel(output, index=False)
 st.download_button(
     "Download Processed Data (Excel)",
     data=output.getvalue(),
-    file_name="processed_icici.xlsx",
+    file_name="processed_output.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
