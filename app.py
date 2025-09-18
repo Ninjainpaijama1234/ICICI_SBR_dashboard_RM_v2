@@ -29,6 +29,39 @@ def is_numeric_series(s: pd.Series) -> bool:
     except Exception:
         return False
 
+def normalize_cols(cols):
+    """Return list of clean string column names."""
+    out = []
+    for c in cols:
+        s = "" if c is None else str(c)
+        s = " ".join(s.strip().split())  # strip + collapse inner spaces
+        out.append(s)
+    return out
+
+def resolve_col(selection: str, columns: list[str]) -> str | None:
+    """
+    Map a UI selection to an actual column name present in 'columns',
+    being robust to stray spaces/casing/slight differences.
+    """
+    if selection is None:
+        return None
+    columns_norm = normalize_cols(columns)
+    sel_norm = " ".join(str(selection).strip().split())
+    # 1) exact
+    if sel_norm in columns_norm:
+        return columns[columns_norm.index(sel_norm)]
+    # 2) case-insensitive
+    sel_cf = sel_norm.casefold()
+    for i, c in enumerate(columns_norm):
+        if c.casefold() == sel_cf:
+            return columns[i]
+    # 3) ignore spaces completely
+    sel_compact = "".join(sel_norm.split()).casefold()
+    for i, c in enumerate(columns_norm):
+        if "".join(c.split()).casefold() == sel_compact:
+            return columns[i]
+    return None
+
 # ----------------------------
 # Black–Scholes
 # ----------------------------
@@ -89,78 +122,70 @@ def monte_carlo_var(S0, mu, sigma, T, n=10000, conf=0.95):
 st.set_page_config(page_title="Risk & Portfolio Dashboard", layout="wide")
 st.title("📊 Risk & Portfolio Dashboard")
 
-# ---- Upload ----
+# ---- Upload + sheet select ----
 uploaded_file = st.file_uploader("Upload Excel (any stock + optional benchmark)", type=["xlsx"])
 if uploaded_file:
-    raw = pd.read_excel(uploaded_file)
+    xls = pd.ExcelFile(uploaded_file)
+    sheet = st.sidebar.selectbox("Worksheet", options=xls.sheet_names, index=0)
+    raw = pd.read_excel(xls, sheet_name=sheet)
     default_name_asset = uploaded_file.name.split(".")[0]
 else:
+    # fallback file (single sheet)
     raw = pd.read_excel("icici dashboard data.xlsx")
     default_name_asset = "ICICI"
 
-# normalize column names to strings
-raw.columns = [str(c) for c in raw.columns]
+# Normalize column names
+raw.columns = normalize_cols(raw.columns)
 raw_cols = list(raw.columns)
 
-# pick a date column guess
+# Guess date column
 date_candidates = [c for c in raw_cols if "date" in c.lower()]
 date_col_guess = date_candidates[0] if date_candidates else raw_cols[0]
 
-# numeric candidates
+# Numeric candidates
 numeric_cols = [c for c in raw_cols if is_numeric_series(raw[c])]
 if not numeric_cols:
     st.error("No numeric columns detected. Please upload a sheet with price/return numerics.")
     st.stop()
 
+# ---- Column mapping UI ----
 st.sidebar.header("🔧 Column Mapping")
-date_col = st.sidebar.selectbox(
-    "Date column", options=raw_cols,
-    index=raw_cols.index(date_col_guess) if date_col_guess in raw_cols else 0
-)
-
-asset_price_col = st.sidebar.selectbox(
-    "Asset Price column", options=numeric_cols,
-    index=0
-)
-
-benchmark_price_col = st.sidebar.selectbox(
-    "Benchmark Price column (optional)",
-    options=["<None>"] + numeric_cols,
-    index=0  # "<None>"
-)
-
-asset_ret_col = st.sidebar.selectbox(
-    "Asset Return column (optional)",
-    options=["<None>"] + numeric_cols,
-    index=0
-)
-
-benchmark_ret_col = st.sidebar.selectbox(
-    "Benchmark Return column (optional)",
-    options=["<None>"] + numeric_cols,
-    index=0
-)
+date_sel = st.sidebar.selectbox("Date column", options=raw_cols,
+                                index=raw_cols.index(date_col_guess) if date_col_guess in raw_cols else 0)
+asset_price_sel = st.sidebar.selectbox("Asset Price column", options=numeric_cols, index=0)
+bench_price_sel = st.sidebar.selectbox("Benchmark Price column (optional)", options=["<None>"] + numeric_cols, index=0)
+asset_ret_sel = st.sidebar.selectbox("Asset Return column (optional)", options=["<None>"] + numeric_cols, index=0)
+bench_ret_sel = st.sidebar.selectbox("Benchmark Return column (optional)", options=["<None>"] + numeric_cols, index=0)
 
 asset_name = st.sidebar.text_input("Display name: Asset", value=default_name_asset)
-bench_name_default = "Benchmark" if benchmark_price_col != "<None>" else ""
+bench_name_default = "Benchmark" if bench_price_sel != "<None>" else ""
 bench_name = st.sidebar.text_input("Display name: Benchmark", value=bench_name_default)
 
-# Validate selections exist
-missing = [c for c in [date_col, asset_price_col] if c not in raw.columns]
+# ---- Resolve selections against CURRENT dataframe columns ----
+date_col = resolve_col(date_sel, raw_cols)
+asset_price_col = resolve_col(asset_price_sel, raw_cols)
+benchmark_price_col = None if bench_price_sel == "<None>" else resolve_col(bench_price_sel, raw_cols)
+asset_ret_col = None if asset_ret_sel == "<None>" else resolve_col(asset_ret_sel, raw_cols)
+benchmark_ret_col = None if bench_ret_sel == "<None>" else resolve_col(bench_ret_sel, raw_cols)
+
+missing = []
+if date_col is None: missing.append("Date")
+if asset_price_col is None: missing.append("Asset Price")
 if missing:
-    st.error(f"Selected column(s) not found: {missing}. Please remap in the sidebar.")
+    st.error(f"Could not resolve required column(s): {', '.join(missing)}. "
+             f"Please re-map in the sidebar. (Tip: check for trailing spaces/case.)")
     st.stop()
-if benchmark_price_col != "<None>" and benchmark_price_col not in raw.columns:
-    st.error(f"Selected benchmark price column not found: {benchmark_price_col}")
+if bench_price_sel != "<None>" and benchmark_price_col is None:
+    st.error("Benchmark Price column could not be resolved. Please re-map.")
     st.stop()
-if asset_ret_col != "<None>" and asset_ret_col not in raw.columns:
-    st.error(f"Selected asset return column not found: {asset_ret_col}")
+if (asset_ret_sel is not None and asset_ret_sel != "<None>") and asset_ret_col is None:
+    st.error("Asset Return column could not be resolved. Please re-map.")
     st.stop()
-if benchmark_ret_col != "<None>" and benchmark_ret_col not in raw.columns:
-    st.error(f"Selected benchmark return column not found: {benchmark_ret_col}")
+if (bench_ret_sel is not None and bench_ret_sel != "<None>") and benchmark_ret_col is None:
+    st.error("Benchmark Return column could not be resolved. Please re-map.")
     st.stop()
 
-# Build working frame
+# ---- Build working frame ----
 df = raw.copy()
 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True).set_index(date_col)
@@ -174,7 +199,6 @@ if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
     df = df.loc[start_d:end_d]
 else:
     st.warning("Invalid date range; using full data.")
-
 if df.empty:
     st.warning("No data in the selected range. Adjust filters.")
     st.stop()
@@ -191,16 +215,27 @@ conf = st.sidebar.select_slider("VaR Confidence Level", options=[0.90, 0.95, 0.9
 norm = pd.DataFrame(index=df.index)
 
 # Asset price/returns
-norm["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
-if asset_ret_col != "<None>":
+try:
+    norm["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
+except KeyError:
+    st.error(f"Selected Asset Price column '{asset_price_sel}' not present after sheet load. "
+             f"Please re-map in the sidebar.")
+    st.stop()
+
+if asset_ret_col is not None:
     norm["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
 else:
     norm["Asset_Return"] = norm["Asset_Price"].pct_change()
 
 # Benchmark (optional)
-if benchmark_price_col != "<None>":
-    norm["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
-    if benchmark_ret_col != "<None>":
+if benchmark_price_col is not None:
+    try:
+        norm["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
+    except KeyError:
+        st.error(f"Selected Benchmark Price column '{bench_price_sel}' not present after sheet load. "
+                 f"Please re-map in the sidebar.")
+        st.stop()
+    if benchmark_ret_col is not None:
         norm["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
     else:
         norm["Bench_Return"] = norm["Bench_Price"].pct_change()
@@ -214,7 +249,6 @@ else:
 st.header("1️⃣ Performance Analysis")
 
 df_reset = norm.reset_index().rename(columns={norm.index.name: "Date"})
-# Some files may have unnamed index; ensure "Date" exists
 if "Date" not in df_reset.columns:
     df_reset["Date"] = df_reset.index
 
@@ -223,29 +257,21 @@ rename_map = {"Asset_Price": asset_name}
 if "Bench_Price" in price_cols:
     rename_map["Bench_Price"] = bench_name or "Benchmark"
 
-fig1 = px.line(
-    df_reset,
-    x="Date",
-    y=price_cols,
-    title=f"{asset_name}" + (f" vs {bench_name}" if "Bench_Price" in price_cols else "") + " — Prices"
-)
-# Relabel traces
+fig1 = px.line(df_reset, x="Date", y=price_cols,
+               title=f"{asset_name}" + (f" vs {bench_name}" if "Bench_Price" in price_cols else "") + " — Prices")
 for i, series in enumerate(price_cols):
     fig1.data[i].name = rename_map.get(series, series)
-st.plotly_chart(fig1, width='stretch')
+st.plotly_chart(fig1, use_container_width=True)
 
 cum_df = pd.DataFrame({"Date": df_reset["Date"]})
 cum_df[f"{asset_name}_CumRet"] = (1 + norm["Asset_Return"].fillna(0)).cumprod().values - 1
 if norm["Bench_Return"].notna().any():
     cum_df[f"{bench_name or 'Benchmark'}_CumRet"] = (1 + norm["Bench_Return"].fillna(0)).cumprod().values - 1
 
-fig_cum = px.line(
-    cum_df,
-    x="Date",
-    y=[c for c in cum_df.columns if c.endswith("_CumRet")],
-    title="Cumulative Returns"
-)
-st.plotly_chart(fig_cum, width='stretch')
+fig_cum = px.line(cum_df, x="Date",
+                  y=[c for c in cum_df.columns if c.endswith("_CumRet")],
+                  title="Cumulative Returns")
+st.plotly_chart(fig_cum, use_container_width=True)
 
 stats_cols = ["Asset_Return"] + (["Bench_Return"] if norm["Bench_Return"].notna().any() else [])
 stats_tbl = norm[stats_cols].agg(["mean", "var", "std"]).rename(
@@ -277,7 +303,7 @@ if norm["Bench_Return"].notna().sum() > 5:
             st.write(f"**Alpha ({asset_name} vs {bench_name or 'Benchmark'}):** {alpha:.6f} | **Beta:** {beta:.4f}")
             fig2 = px.scatter(reg_df.reset_index(), x="Bench_Return", y="Asset_Return",
                               trendline="ols", title=f"Regression: {asset_name} vs {bench_name or 'Benchmark'} (daily returns)")
-            st.plotly_chart(fig2, width='stretch')
+            st.plotly_chart(fig2, use_container_width=True)
         except Exception as e:
             st.warning(f"Regression failed: {e}")
     else:
@@ -397,7 +423,7 @@ with tab_direct:
         fig_sens = px.line(sens_df, x="Shock_bps", y="EquityShock_pct",
                            title="Equity Shock % vs Parallel Yield Shift (bps)")
         fig_sens.update_traces(mode="lines+markers")
-        st.plotly_chart(fig_sens, width='stretch')
+        st.plotly_chart(fig_sens, use_container_width=True)
     else:
         st.info("Provide valid A, L, DA, DL (and ensure A ≠ 0) to run the sensitivity sweep.")
 
@@ -470,7 +496,7 @@ else:
                         title=f"Monte Carlo Terminal Return Distribution ({asset_name}, Horizon = {time_horizon:.2f} years, {n_sims} paths)")
     fig3.add_vline(x=float(var_horizon), line_dash="dash", line_color="red",
                    annotation_text=f"VaR {int(conf*100)}%", annotation_position="top right")
-    st.plotly_chart(fig3, width='stretch')
+    st.plotly_chart(fig3, use_container_width=True)
     st.write(f"**Confidence:** {int(conf*100)}%")
     st.write(f"**Probability of Loss over horizon:** {prob_loss:.2%}")
     st.write(f"**Mean Terminal Return:** {mean_ret:.2%} | **Median:** {p50:.2%} | **5th pct:** {p5:.2%} | **95th pct:** {p95:.2%}")
