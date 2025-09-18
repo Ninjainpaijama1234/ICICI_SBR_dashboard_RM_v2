@@ -54,6 +54,25 @@ def resolve_col(selection: str, columns: list[str]) -> str | None:
             return columns[i]
     return None
 
+def clamp_pct(x):
+    if x is None or np.isnan(x):
+        return np.nan
+    return float(np.minimum(1.0, np.maximum(0.0, x)))
+
+def detect_return_scale(r: pd.Series) -> bool:
+    """
+    Heuristic: returns True if series looks like PERCENT units (e.g., 1.2 = 1.2%).
+    Triggers when median(|r|) between 0.5 and 100 OR max(|r|) > 2 but < 200.
+    """
+    r = pd.to_numeric(pd.Series(r).dropna(), errors="coerce")
+    if r.empty:
+        return False
+    med_abs = float(np.median(np.abs(r)))
+    max_abs = float(np.max(np.abs(r)))
+    if (0.5 <= med_abs <= 100) or (2 < max_abs < 200):
+        return True
+    return False
+
 # ----------------------------
 # Black–Scholes
 # ----------------------------
@@ -93,30 +112,32 @@ def _rolling_compounded(returns: pd.Series, window_days: int) -> np.ndarray:
     return comp.dropna().values
 
 def hist_var_pct(returns, conf=0.95, horizon_days=1):
-    """Historical VaR% as positive loss over horizon; uses left-tail (1-conf)."""
+    """Historical VaR% as positive loss over horizon; left-tail (1-conf)."""
     horizon_rets = _rolling_compounded(pd.Series(returns), max(1, int(horizon_days)))
     if horizon_rets.size == 0:
         return np.nan
     q_left = np.percentile(horizon_rets, (1 - conf) * 100.0)
     return max(0.0, -q_left)
 
-def parametric_var_pct(returns, conf=0.95, horizon_days=1):
-    """Parametric VaR% (Normal) as positive loss; mu*n, sigma*sqrt(n); left-tail (1-conf)."""
+def parametric_var_pct_lognormal(returns, conf=0.95, horizon_days=1):
+    """
+    Parametric VaR% assuming lognormal prices (log-returns ~ Normal).
+    VaR% = -[exp(mu_log*H + sigma_log*sqrt(H)*z_{1-conf}) - 1]
+    """
     r = pd.Series(returns).dropna().astype(float).values
     if r.size == 0:
         return np.nan
-    n = max(1, int(horizon_days))
-    mu_d, sig_d = r.mean(), r.std(ddof=1)
-    if np.isnan(mu_d) or np.isnan(sig_d):
-        return np.nan
-    mu_H = mu_d * n
-    sig_H = sig_d * np.sqrt(n)
-    q_left = mu_H + sig_H * sps.norm.ppf(1 - conf)
-    return max(0.0, -q_left)
+    log_r = np.log1p(r)
+    mu_log_d = np.nanmean(log_r)
+    sig_log_d = np.nanstd(log_r, ddof=1)
+    H = max(1, int(horizon_days))
+    z = sps.norm.ppf(1 - conf)  # left tail
+    q = np.exp(mu_log_d * H + sig_log_d * np.sqrt(H) * z) - 1.0
+    return max(0.0, -q)
 
 def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=None):
     """
-    Monte Carlo VaR% using DAILY LOG-RETURN calibration.
+    Monte Carlo VaR% using daily log-return calibration (same as parametric).
     VaR% = -quantile_{1-conf}(simulated horizon return).
     """
     r = pd.Series(returns).dropna().astype(float).values
@@ -128,10 +149,8 @@ def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=No
     mu_log_d = np.nanmean(log_r)
     sig_log_d = np.nanstd(log_r, ddof=1)
     H = max(1, int(horizon_days))
-    mu_H = mu_log_d * H
-    sig_H = sig_log_d * np.sqrt(H)
-    sims = np.exp(mu_H + sig_H * np.random.randn(int(n))) - 1.0
-    q_left = np.percentile(sims, (1 - conf) * 100.0)  # ← uses slider conf
+    sims = np.exp(mu_log_d * H + sig_log_d * np.sqrt(H) * np.random.randn(int(n))) - 1.0
+    q_left = np.percentile(sims, (1 - conf) * 100.0)
     return max(0.0, -q_left)
 
 # ----------------------------
@@ -220,7 +239,6 @@ if df.empty:
     st.stop()
 
 st.sidebar.subheader("Parameters")
-notional = st.sidebar.number_input("Notional Value", min_value=0.0, value=10000.0, step=100.0)
 risk_free = st.sidebar.slider("Risk-Free Rate (%)", 0.0, 10.0, 5.0) / 100.0
 volatility_ui = st.sidebar.slider("Volatility (%)", 0.0, 100.0, 30.0) / 100.0
 time_horizon = st.sidebar.slider("Time Horizon (Years)", 0.1, 5.0, 1.0)
@@ -231,17 +249,33 @@ conf = st.sidebar.select_slider("VaR Confidence Level", options=[0.90, 0.95, 0.9
 ndf = pd.DataFrame(index=df.index)
 
 ndf["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
+
+# Asset returns: from column or compute
 if asset_ret_col is not None:
     ndf["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
 else:
     ndf["Asset_Return"] = ndf["Asset_Price"].pct_change()
 
+# ---- NEW: auto-detect % units and allow override ----
+auto_pct = detect_return_scale(ndf["Asset_Return"])
+with st.sidebar.expander("Return Scaling (if uploaded returns are in % units)"):
+    st.write("If your return column is e.g., **1.2 = 1.2%**, enable scaling to convert to decimals.")
+    force_pct = st.checkbox("Treat Asset Return column as % (divide by 100)", value=auto_pct, key="asset_pct_flag")
+if st.session_state.get("asset_pct_flag", False):
+    ndf["Asset_Return"] = ndf["Asset_Return"] / 100.0
+
+# Benchmark (optional) + scaling
 if benchmark_price_col is not None:
     ndf["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
     if benchmark_ret_col is not None:
         ndf["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
     else:
         ndf["Bench_Return"] = ndf["Bench_Price"].pct_change()
+    auto_pct_b = detect_return_scale(ndf["Bench_Return"])
+    with st.sidebar.expander("Benchmark Return Scaling"):
+        force_pct_b = st.checkbox("Treat Benchmark Return column as % (divide by 100)", value=auto_pct_b, key="bench_pct_flag")
+    if st.session_state.get("bench_pct_flag", False):
+        ndf["Bench_Return"] = ndf["Bench_Return"] / 100.0
 else:
     ndf["Bench_Price"] = np.nan
     ndf["Bench_Return"] = np.nan
@@ -283,6 +317,19 @@ stats_tbl = ndf[stats_cols].agg(["mean", "var", "std"]).rename(
 st.write("**Return Stats (daily):**")
 st.dataframe(stats_tbl, use_container_width=True)
 
+# Diagnostics to validate scaling
+diag = pd.DataFrame({
+    "Metric": ["Mean (daily)", "Std (daily)", "Min", "Max"],
+    "Value (%)": [
+        safe_mean(ndf["Asset_Return"]) * 100.0,
+        safe_std(ndf["Asset_Return"]) * 100.0,
+        pd.Series(ndf["Asset_Return"]).min() * 100.0,
+        pd.Series(ndf["Asset_Return"]).max() * 100.0,
+    ]
+})
+st.caption("Return diagnostics (after scaling):")
+st.dataframe(diag.style.format({"Value (%)": "{:.4f}"}), use_container_width=True)
+
 # ==========================
 # 2) Risk–Return
 # ==========================
@@ -315,19 +362,22 @@ else:
     st.info("No benchmark selected/provided → skipping Alpha/Beta.")
 
 # ==========================
-# 3) VaR (Asset) — Percent ONLY, horizon-aware
+# 3) VaR (Asset) — Percent ONLY, horizon-aware (LOGNORMAL parametric)
 # ==========================
 st.header("3️⃣ Value at Risk (VaR) — Percent Loss (no amounts)")
 
-h_days = max(1, int(round(252 * float(time_horizon))))  # horizon in trading days
-
+h_days = max(1, int(round(252 * float(time_horizon))))
 hist_var_percent = hist_var_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
-para_var_percent = parametric_var_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
+para_var_percent = parametric_var_pct_lognormal(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
 mc_var_percent   = mc_var_pct_from_returns(ndf["Asset_Return"], conf=conf, horizon_days=h_days, n=10000)
 
-st.caption(f"Left-tail quantile used = (1 − Confidence). Holding period: {h_days} day(s). Confidence: {int(conf*100)}%")
+hist_var_percent = clamp_pct(hist_var_percent)
+para_var_percent = clamp_pct(para_var_percent)
+mc_var_percent   = clamp_pct(mc_var_percent)
+
+st.caption(f"Left-tail quantile = (1 − Confidence). Holding period: {h_days} day(s). Confidence: {int(conf*100)}%")
 st.write(f"**Historical VaR (loss):** {hist_var_percent:.2%}")
-st.write(f"**Parametric VaR (loss):** {para_var_percent:.2%}")
+st.write(f"**Parametric VaR (loss) [lognormal]:** {para_var_percent:.2%}")
 st.write(f"**Monte Carlo VaR (loss):** {mc_var_percent:.2%}")
 
 # ==========================
@@ -348,7 +398,7 @@ st.write(f"**Price:** {price:.4f} | **Delta:** {delta:.4f} | **Gamma:** {gamma:.
          f"**Theta:** {theta:.4f} | **Vega:** {vega:.4f} | **Rho:** {rho:.4f}")
 
 # ==========================
-# 5) ALM (Direct + CSV with auto-durations + ΔEVE)
+# 5) Asset Liability Management (ALM)
 # ==========================
 st.header("5️⃣ Asset Liability Management (ALM)")
 
@@ -395,7 +445,7 @@ with tab_direct:
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Equity E = A − L", f"{E:,.2f}"); st.metric("DA (years)", f"{DA:.2f}")
     with c2: st.metric("DL (years)", f"{DL:.2f}");       st.metric("Duration Gap (DG)", f"{DG:.4f}" if not np.isnan(DG) else "—")
-    with c3: st.metric("Δy", f"{dy:.4%}");               st.metric("Equity Shock (%)", f"{shock_pct:.2f}%" if not np.isnan(shock_pct) else "—")
+    with c3: st.metric("Δy", f"{dy:.4%}");               st.metric("Equity Shock (%)", f"{(shock_pct if not np.isnan(shock_pct) else 0):.2f}%")
     st.write(f"**ΔE (amount):** {dE_total:,.2f} | **Linear:** {0.0 if np.isnan(dE_linear) else dE_linear:,.2f} | **Convexity:** {dE_conv:,.2f}")
 
     st.subheader("ΔEVE Sensitivity: Equity Shock vs Yield Shift")
@@ -461,13 +511,12 @@ with tab_csv:
             st.info("CSV must include columns: Type, Amount. (Optional: Midpoint_Years).")
 
 # ==========================
-# 6) Portfolio Simulation (Monte Carlo, left-tail matches slider)
+# 6) Portfolio Simulation (Monte Carlo, consistent with VaR)
 # ==========================
 st.header("6️⃣ Portfolio Simulation")
 
-mu_daily  = safe_mean(ndf["Asset_Return"])
-sig_daily = safe_std(ndf["Asset_Return"])
-if np.isnan(mu_daily) or np.isnan(sig_daily) or sig_daily < 0:
+log_r = np.log1p(ndf["Asset_Return"].dropna().values.astype(float))
+if log_r.size < 5 or np.isnan(log_r).all():
     st.info("Insufficient data to simulate returns.")
 else:
     n_sims  = st.slider("Number of simulations", 1000, 100_000, 10_000, step=1000)
@@ -477,17 +526,11 @@ else:
         seed_val = st.number_input("Seed", min_value=0, value=42, step=1)
         np.random.seed(int(seed_val))
 
-    # GBM with daily log-return calibration
-    dt = 1.0 / 252.0
-    drift = (mu_daily - 0.5 * (sig_daily ** 2)) * dt
-    diff  = sig_daily * np.sqrt(dt)
-    Z = np.random.randn(n_sims, steps_y)
-    log_growth = drift * steps_y + diff * Z.sum(axis=1)
-    term_returns = np.exp(log_growth) - 1.0
+    mu_log_d = float(np.nanmean(log_r))
+    sig_log_d = float(np.nanstd(log_r, ddof=1))
+    term_returns = np.exp(mu_log_d * steps_y + sig_log_d * np.sqrt(steps_y) * np.random.randn(n_sims)) - 1.0
 
-    # VaR at left-tail (1 - conf), per slider
     var_left = np.percentile(term_returns, (1 - conf) * 100.0)
-
     prob_loss = float((term_returns < 0).mean())
     mean_ret  = float(np.mean(term_returns))
     p5, p50, p95 = np.percentile(term_returns, [5, 50, 95])
