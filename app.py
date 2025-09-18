@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-from scipy.stats import norm
+import scipy.stats as sps
 from statsmodels.api import OLS, add_constant
 
 # ----------------------------
@@ -40,22 +40,22 @@ def normalize_cols(cols):
 
 def resolve_col(selection: str, columns: list[str]) -> str | None:
     """
-    Map a UI selection to an actual column name present in 'columns',
-    being robust to stray spaces/casing/slight differences.
+    Map a UI selection to an actual column in 'columns',
+    robust to spaces/casing.
     """
     if selection is None:
         return None
     columns_norm = normalize_cols(columns)
     sel_norm = " ".join(str(selection).strip().split())
-    # 1) exact
+    # exact
     if sel_norm in columns_norm:
         return columns[columns_norm.index(sel_norm)]
-    # 2) case-insensitive
+    # case-insensitive
     sel_cf = sel_norm.casefold()
     for i, c in enumerate(columns_norm):
         if c.casefold() == sel_cf:
             return columns[i]
-    # 3) ignore spaces completely
+    # compact (ignore spaces)
     sel_compact = "".join(sel_norm.split()).casefold()
     for i, c in enumerate(columns_norm):
         if "".join(c.split()).casefold() == sel_compact:
@@ -73,17 +73,17 @@ def black_scholes(S, K, r, sigma, T, option_type="call"):
         d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
         if option_type == "call":
-            price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-            rho =  K * T * np.exp(-r * T) * norm.cdf(d2)
-            delta = norm.cdf(d1)
+            price = S * sps.norm.cdf(d1) - K * np.exp(-r * T) * sps.norm.cdf(d2)
+            rho =  K * T * np.exp(-r * T) * sps.norm.cdf(d2)
+            delta = sps.norm.cdf(d1)
         else:
-            price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-            rho = -K * T * np.exp(-r * T) * norm.cdf(-d2)
-            delta = -norm.cdf(-d1)
-        gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-        theta = (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T))
-                 - r * K * np.exp(-r * T) * (norm.cdf(d2) if option_type=="call" else norm.cdf(-d2)))
-        vega = S * norm.pdf(d1) * np.sqrt(T)
+            price = K * np.exp(-r * T) * sps.norm.cdf(-d2) - S * sps.norm.cdf(-d1)
+            rho = -K * T * np.exp(-r * T) * sps.norm.cdf(-d2)
+            delta = -sps.norm.cdf(-d1)
+        gamma = sps.norm.pdf(d1) / (S * sigma * np.sqrt(T))
+        theta = (-S * sps.norm.pdf(d1) * sigma / (2 * np.sqrt(T))
+                 - r * K * np.exp(-r * T) * (sps.norm.cdf(d2) if option_type=="call" else sps.norm.cdf(-d2)))
+        vega = S * sps.norm.pdf(d1) * np.sqrt(T)
         return price, delta, gamma, theta, vega, rho
     except Exception:
         return (np.nan,)*6
@@ -102,9 +102,10 @@ def parametric_var(returns, conf=0.95):
     mu, sigma = r.mean(), r.std(ddof=1)
     if np.isnan(mu) or np.isnan(sigma):
         return np.nan
-    return mu - sigma * norm.ppf(conf)
+    return mu - sigma * sps.norm.ppf(conf)
 
 def monte_carlo_var(S0, mu, sigma, T, n=10000, conf=0.95):
+    """One-step lognormal approximation for VaR section."""
     try:
         S0 = float(S0); mu = float(mu); sigma = float(sigma); T = float(T)
         if S0 <= 0 or sigma < 0 or T <= 0 or n <= 10:
@@ -130,7 +131,6 @@ if uploaded_file:
     raw = pd.read_excel(xls, sheet_name=sheet)
     default_name_asset = uploaded_file.name.split(".")[0]
 else:
-    # fallback file (single sheet)
     raw = pd.read_excel("icici dashboard data.xlsx")
     default_name_asset = "ICICI"
 
@@ -211,48 +211,48 @@ time_horizon = st.sidebar.slider("Time Horizon (Years)", 0.1, 5.0, 1.0)
 conf = st.sidebar.select_slider("VaR Confidence Level", options=[0.90, 0.95, 0.99], value=0.95,
                                 format_func=lambda x: f"{int(x*100)}%")
 
-# ---- Normalize to logical names ----
-norm = pd.DataFrame(index=df.index)
+# ---- Normalize to logical names (ndf) ----
+ndf = pd.DataFrame(index=df.index)
 
 # Asset price/returns
 try:
-    norm["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
+    ndf["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
 except KeyError:
     st.error(f"Selected Asset Price column '{asset_price_sel}' not present after sheet load. "
              f"Please re-map in the sidebar.")
     st.stop()
 
 if asset_ret_col is not None:
-    norm["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
+    ndf["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
 else:
-    norm["Asset_Return"] = norm["Asset_Price"].pct_change()
+    ndf["Asset_Return"] = ndf["Asset_Price"].pct_change()
 
 # Benchmark (optional)
 if benchmark_price_col is not None:
     try:
-        norm["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
+        ndf["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
     except KeyError:
         st.error(f"Selected Benchmark Price column '{bench_price_sel}' not present after sheet load. "
                  f"Please re-map in the sidebar.")
         st.stop()
     if benchmark_ret_col is not None:
-        norm["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
+        ndf["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
     else:
-        norm["Bench_Return"] = norm["Bench_Price"].pct_change()
+        ndf["Bench_Return"] = ndf["Bench_Price"].pct_change()
 else:
-    norm["Bench_Price"] = np.nan
-    norm["Bench_Return"] = np.nan
+    ndf["Bench_Price"] = np.nan
+    ndf["Bench_Return"] = np.nan
 
 # ==========================
 # 1) Performance
 # ==========================
 st.header("1️⃣ Performance Analysis")
 
-df_reset = norm.reset_index().rename(columns={norm.index.name: "Date"})
+df_reset = ndf.reset_index().rename(columns={ndf.index.name: "Date"})
 if "Date" not in df_reset.columns:
     df_reset["Date"] = df_reset.index
 
-price_cols = ["Asset_Price"] + (["Bench_Price"] if norm["Bench_Price"].notna().any() else [])
+price_cols = ["Asset_Price"] + (["Bench_Price"] if ndf["Bench_Price"].notna().any() else [])
 rename_map = {"Asset_Price": asset_name}
 if "Bench_Price" in price_cols:
     rename_map["Bench_Price"] = bench_name or "Benchmark"
@@ -264,17 +264,17 @@ for i, series in enumerate(price_cols):
 st.plotly_chart(fig1, use_container_width=True)
 
 cum_df = pd.DataFrame({"Date": df_reset["Date"]})
-cum_df[f"{asset_name}_CumRet"] = (1 + norm["Asset_Return"].fillna(0)).cumprod().values - 1
-if norm["Bench_Return"].notna().any():
-    cum_df[f"{bench_name or 'Benchmark'}_CumRet"] = (1 + norm["Bench_Return"].fillna(0)).cumprod().values - 1
+cum_df[f"{asset_name}_CumRet"] = (1 + ndf["Asset_Return"].fillna(0)).cumprod().values - 1
+if ndf["Bench_Return"].notna().any():
+    cum_df[f"{bench_name or 'Benchmark'}_CumRet"] = (1 + ndf["Bench_Return"].fillna(0)).cumprod().values - 1
 
 fig_cum = px.line(cum_df, x="Date",
                   y=[c for c in cum_df.columns if c.endswith("_CumRet")],
                   title="Cumulative Returns")
 st.plotly_chart(fig_cum, use_container_width=True)
 
-stats_cols = ["Asset_Return"] + (["Bench_Return"] if norm["Bench_Return"].notna().any() else [])
-stats_tbl = norm[stats_cols].agg(["mean", "var", "std"]).rename(
+stats_cols = ["Asset_Return"] + (["Bench_Return"] if ndf["Bench_Return"].notna().any() else [])
+stats_tbl = ndf[stats_cols].agg(["mean", "var", "std"]).rename(
     columns={"Asset_Return": asset_name, "Bench_Return": bench_name or "Benchmark"}
 )
 st.write("**Return Stats (daily):**")
@@ -286,14 +286,15 @@ st.dataframe(stats_tbl, use_container_width=True)
 st.header("2️⃣ Risk-Return Analysis")
 
 rf_daily = risk_free / 252.0
-excess = (norm["Asset_Return"] - rf_daily).dropna().values
-downside = (norm["Asset_Return"][norm["Asset_Return"] < 0] - rf_daily).dropna().values
+excess = (ndf["Asset_Return"] - rf_daily).dropna().values
+downside = (ndf["Asset_Return"][ndf["Asset_Return"] < 0] - rf_daily).dropna().values
 sharpe = np.sqrt(252.0) * safe_div(safe_mean(excess), safe_std(excess))
 sortino = np.sqrt(252.0) * safe_div(safe_mean(excess), safe_std(downside))
 st.write(f"**Sharpe Ratio ({asset_name}):** {sharpe:.3f} | **Sortino Ratio:** {sortino:.3f}")
 
-if norm["Bench_Return"].notna().sum() > 5:
-    reg_df = norm[["Asset_Return", "Bench_Return"]].dropna()
+# Alpha/Beta if benchmark present
+if ndf["Bench_Return"].notna().sum() > 5:
+    reg_df = ndf[["Asset_Return", "Bench_Return"]].dropna()
     if not reg_df.empty and reg_df["Bench_Return"].nunique() > 1:
         X = add_constant(reg_df["Bench_Return"].values.astype(float))
         y = reg_df["Asset_Return"].values.astype(float)
@@ -316,13 +317,13 @@ else:
 # ==========================
 st.header("3️⃣ Value at Risk (VaR) — on Asset")
 
-hist_var_val = historical_var(norm["Asset_Return"], conf)
-param_var_val = parametric_var(norm["Asset_Return"], conf)
-last_price = norm["Asset_Price"].dropna().iloc[-1] if norm["Asset_Price"].dropna().size else np.nan
+hist_var_val = historical_var(ndf["Asset_Return"], conf)
+param_var_val = parametric_var(ndf["Asset_Return"], conf)
+last_price = ndf["Asset_Price"].dropna().iloc[-1] if ndf["Asset_Price"].dropna().size else np.nan
 mc_var_val = monte_carlo_var(
     S0=last_price,
-    mu=safe_mean(norm["Asset_Return"]),
-    sigma=safe_std(norm["Asset_Return"]),
+    mu=safe_mean(ndf["Asset_Return"]),
+    sigma=safe_std(ndf["Asset_Return"]),
     T=time_horizon, n=10000, conf=conf
 )
 
@@ -470,8 +471,8 @@ with tab_csv:
 # ==========================
 st.header("6️⃣ Portfolio Simulation")
 
-mu_daily  = safe_mean(norm["Asset_Return"])
-sig_daily = safe_std(norm["Asset_Return"])
+mu_daily  = safe_mean(ndf["Asset_Return"])
+sig_daily = safe_std(ndf["Asset_Return"])
 if np.isnan(mu_daily) or np.isnan(sig_daily) or sig_daily < 0:
     st.info("Insufficient data to simulate returns.")
 else:
@@ -509,8 +510,8 @@ else:
 # ==========================
 st.header("7️⃣ Download Options")
 output = io.BytesIO()
-export_df = norm.copy()
-export_df.reset_index().rename(columns={norm.index.name: "Date"}).to_excel(output, index=False)
+export_df = ndf.copy()
+export_df.reset_index().rename(columns={ndf.index.name: "Date"}).to_excel(output, index=False)
 st.download_button(
     "Download Processed Data (Excel)",
     data=output.getvalue(),
