@@ -7,8 +7,13 @@ import scipy.stats as sps
 from statsmodels.api import OLS, add_constant
 
 # ======================================
-# Helpers
+# Generic helpers
 # ======================================
+
+def file_scope_key(suffix: str, uploaded_file) -> str:
+    """Generate a widget key that resets when a new file is uploaded."""
+    base = uploaded_file.name if uploaded_file else "DEFAULT_FILE"
+    return f"{base}__{suffix}"
 
 def safe_std(x):
     x = np.asarray(x, dtype=float)
@@ -55,6 +60,12 @@ def resolve_col(selection: str, columns: list[str]) -> str | None:
             return columns[i]
     return None
 
+def assert_in_df(df: pd.DataFrame, col: str | None, label: str):
+    """Stop with helpful error if the mapped column is missing."""
+    if col is None or col not in df.columns:
+        st.error(f"❌ {label} column not found: `{col}`.\n\n**Available columns:** {list(df.columns)}")
+        st.stop()
+
 def clamp_pct(x):
     if x is None or np.isnan(x):
         return np.nan
@@ -66,26 +77,22 @@ def detect_return_scale(r: pd.Series) -> bool:
         return False
     med_abs = float(np.median(np.abs(r)))
     max_abs = float(np.max(np.abs(r)))
+    # looks like % units (e.g., 1.2 = 1.2%)
     if (0.5 <= med_abs <= 100) or (2 < max_abs < 200):
         return True
     return False
 
-def reset_with_date_index(frame: pd.DataFrame) -> pd.DataFrame:
-    """
-    Robustly create a 'Date' column after reset_index().
-    - Pick the first datetime-like column if present
-    - Else coerce the first column to datetime
-    """
+def reset_with_date(frame: pd.DataFrame) -> pd.DataFrame:
+    """Robustly create a 'Date' column from the index or first datetime-like column."""
     tmp = frame.reset_index()
-    # Identify datetime-like columns
-    dt_cols = [c for c in tmp.columns if pd.api.types.is_datetime64_any_dtype(tmp[c])]
-    if dt_cols:
-        dcol = dt_cols[0]
+    # If an existing datetime col is present, use the leftmost
+    dt_candidates = [c for c in tmp.columns if pd.api.types.is_datetime64_any_dtype(tmp[c])]
+    if dt_candidates:
+        dcol = dt_candidates[0]
     else:
-        # Use the first column as date carrier
+        # Fall back to the leftmost column; coerce to datetime
         dcol = tmp.columns[0]
         tmp[dcol] = pd.to_datetime(tmp[dcol], errors="coerce")
-    # Rename selected date column to 'Date'
     if dcol != "Date":
         tmp = tmp.rename(columns={dcol: "Date"})
     return tmp
@@ -162,7 +169,7 @@ def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=No
     return max(0.0, -q_left)
 
 # ======================================
-# Streamlit App
+# App
 # ======================================
 st.set_page_config(page_title="Risk & Portfolio Dashboard", layout="wide")
 st.title("📊 Risk & Portfolio Dashboard")
@@ -172,7 +179,10 @@ uploaded_file = st.file_uploader("Upload Excel (any stock + optional benchmark)"
 if uploaded_file:
     try:
         xls = pd.ExcelFile(uploaded_file)
-        sheet = st.sidebar.selectbox("Worksheet", options=xls.sheet_names, index=0)
+        sheet = st.sidebar.selectbox("Worksheet",
+                                     options=xls.sheet_names,
+                                     index=0,
+                                     key=file_scope_key("sheet", uploaded_file))
         raw = pd.read_excel(xls, sheet_name=sheet)
     except Exception:
         raw = pd.read_excel(uploaded_file)  # fallback single-sheet
@@ -186,25 +196,41 @@ raw.columns = normalize_cols(raw.columns)
 raw_cols = list(raw.columns)
 
 # ---------- Column mapping ----------
-date_candidates = [c for c in raw_cols if "date" in c.lower()]
-date_col_guess = date_candidates[0] if date_candidates else raw_cols[0]
+date_guess = next((c for c in raw_cols if "date" in c.lower()), raw_cols[0])
 numeric_cols = [c for c in raw_cols if is_numeric_series(raw[c])]
-
 if not numeric_cols:
     st.error("No numeric columns detected. Please upload a sheet with price/return numerics.")
     st.stop()
 
 st.sidebar.header("🔧 Column Mapping")
-date_sel = st.sidebar.selectbox("Date column", options=raw_cols,
-                                index=raw_cols.index(date_col_guess) if date_col_guess in raw_cols else 0)
-asset_price_sel = st.sidebar.selectbox("Asset Price column", options=numeric_cols, index=0)
-bench_price_sel = st.sidebar.selectbox("Benchmark Price column (optional)", options=["<None>"] + numeric_cols, index=0)
-asset_ret_sel = st.sidebar.selectbox("Asset Return column (optional)", options=["<None>"] + numeric_cols, index=0)
-bench_ret_sel = st.sidebar.selectbox("Benchmark Return column (optional)", options=["<None>"] + numeric_cols, index=0)
+date_sel = st.sidebar.selectbox("Date column",
+                                options=raw_cols,
+                                index=(raw_cols.index(date_guess) if date_guess in raw_cols else 0),
+                                key=file_scope_key("date_col", uploaded_file))
+asset_price_sel = st.sidebar.selectbox("Asset Price column",
+                                       options=numeric_cols,
+                                       index=0,
+                                       key=file_scope_key("asset_price_col", uploaded_file))
+bench_price_sel = st.sidebar.selectbox("Benchmark Price column (optional)",
+                                       options=["<None>"] + numeric_cols,
+                                       index=0,
+                                       key=file_scope_key("bench_price_col", uploaded_file))
+asset_ret_sel = st.sidebar.selectbox("Asset Return column (optional)",
+                                     options=["<None>"] + numeric_cols,
+                                     index=0,
+                                     key=file_scope_key("asset_ret_col", uploaded_file))
+bench_ret_sel = st.sidebar.selectbox("Benchmark Return column (optional)",
+                                     options=["<None>"] + numeric_cols,
+                                     index=0,
+                                     key=file_scope_key("bench_ret_col", uploaded_file))
 
-asset_name = st.sidebar.text_input("Display name: Asset", value=default_name_asset)
+asset_name = st.sidebar.text_input("Display name: Asset",
+                                   value=default_name_asset,
+                                   key=file_scope_key("asset_name", uploaded_file))
 bench_name_default = "Benchmark" if bench_price_sel != "<None>" else ""
-bench_name = st.sidebar.text_input("Display name: Benchmark", value=bench_name_default)
+bench_name = st.sidebar.text_input("Display name: Benchmark",
+                                   value=bench_name_default,
+                                   key=file_scope_key("bench_name", uploaded_file))
 
 # Resolve selections to actual columns
 date_col = resolve_col(date_sel, raw_cols)
@@ -213,27 +239,17 @@ benchmark_price_col = None if bench_price_sel == "<None>" else resolve_col(bench
 asset_ret_col = None if asset_ret_sel == "<None>" else resolve_col(asset_ret_sel, raw_cols)
 benchmark_ret_col = None if bench_ret_sel == "<None>" else resolve_col(bench_ret_sel, raw_cols)
 
-missing = []
-if date_col is None: missing.append("Date")
-if asset_price_col is None: missing.append("Asset Price")
-if missing:
-    st.error(f"Could not resolve required column(s): {', '.join(missing)}. Please re-map in the sidebar.")
-    st.write("Columns available:", raw_cols)
-    st.stop()
-if bench_price_sel != "<None>" and benchmark_price_col is None:
-    st.error("Benchmark Price column could not be resolved. Please re-map.")
-    st.write("Columns available:", raw_cols)
-    st.stop()
-if (asset_ret_sel not in (None, "<None>")) and asset_ret_col is None:
-    st.error("Asset Return column could not be resolved. Please re-map.")
-    st.write("Columns available:", raw_cols)
-    st.stop()
-if (bench_ret_sel not in (None, "<None>")) and benchmark_ret_col is None:
-    st.error("Benchmark Return column could not be resolved. Please re-map.")
-    st.write("Columns available:", raw_cols)
-    st.stop()
-
 # ---------- Build indexed frame ----------
+# Validate presence BEFORE using
+assert_in_df(raw, date_col, "Date")
+assert_in_df(raw, asset_price_col, "Asset Price")
+if benchmark_price_col is not None:
+    assert_in_df(raw, benchmark_price_col, "Benchmark Price")
+if asset_ret_col is not None:
+    assert_in_df(raw, asset_ret_col, "Asset Return")
+if benchmark_ret_col is not None:
+    assert_in_df(raw, benchmark_ret_col, "Benchmark Return")
+
 df = raw.copy()
 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True).set_index(date_col)
@@ -241,7 +257,8 @@ df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True).s
 # ---------- Filters & Params ----------
 st.sidebar.header("Filters")
 min_d, max_d = df.index.min(), df.index.max()
-date_range = st.sidebar.date_input("Select Date Range", [min_d, max_d])
+date_range = st.sidebar.date_input("Select Date Range", [min_d, max_d],
+                                   key=file_scope_key("daterange", uploaded_file))
 if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
     start_d, end_d = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
     df = df.loc[start_d:end_d]
@@ -251,42 +268,56 @@ if df.empty:
     st.warning("No data in the selected range. Adjust filters.")
     st.stop()
 
-st.sidebar.subheader("Parameters")
-risk_free = st.sidebar.slider("Risk-Free Rate (%)", 0.0, 10.0, 5.0) / 100.0
-volatility_ui = st.sidebar.slider("Volatility (%)", 0.0, 100.0, 30.0) / 100.0
-time_horizon = st.sidebar.slider("Time Horizon (Years)", 0.1, 5.0, 1.0)
-conf = st.sidebar.select_slider("VaR Confidence Level", options=[0.90, 0.95, 0.99], value=0.95,
+st.sidebar.subheader("Global Parameters")
+risk_free = st.sidebar.slider("Risk-Free Rate (%)", 0.0, 10.0, 5.0,
+                              key=file_scope_key("rf", uploaded_file)) / 100.0
+volatility_ui = st.sidebar.slider("Volatility (%)", 0.0, 100.0, 30.0,
+                                  key=file_scope_key("vol_ui", uploaded_file)) / 100.0
+time_horizon = st.sidebar.slider("Time Horizon (Years)", 0.1, 5.0, 1.0,
+                                 key=file_scope_key("horizon", uploaded_file))
+conf = st.sidebar.select_slider("VaR Confidence Level",
+                                options=[0.90, 0.95, 0.99],
+                                value=0.95,
+                                key=file_scope_key("var_conf", uploaded_file),
                                 format_func=lambda x: f"{int(x*100)}%")
 
 # ---------- Normalized working frame ----------
 ndf = pd.DataFrame(index=df.index)
 
 # Asset price/returns
+assert_in_df(df, asset_price_col, "Asset Price (filtered)")
 ndf["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
 if asset_ret_col is not None:
+    assert_in_df(df, asset_ret_col, "Asset Return (filtered)")
     ndf["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
 else:
     ndf["Asset_Return"] = ndf["Asset_Price"].pct_change()
 
 # Auto-scale returns and override
 auto_pct = detect_return_scale(ndf["Asset_Return"])
-with st.sidebar.expander("Return Scaling (if uploaded returns are in % units)"):
-    st.write("If your return column is e.g., **1.2 = 1.2%**, enable scaling to convert to decimals.")
-    force_pct = st.checkbox("Treat Asset Return column as % (divide by 100)", value=auto_pct, key="asset_pct_flag")
-if st.session_state.get("asset_pct_flag", False):
+with st.sidebar.expander("Return Scaling (if uploaded returns are % units)"):
+    st.write("If return column uses % units (e.g., 1.2 = 1.2%), enable scaling.")
+    force_pct = st.checkbox("Treat Asset Return column as % (divide by 100)",
+                            value=auto_pct,
+                            key=file_scope_key("asset_pct_flag", uploaded_file))
+if st.session_state.get(file_scope_key("asset_pct_flag", uploaded_file), False):
     ndf["Asset_Return"] = ndf["Asset_Return"] / 100.0
 
 # Benchmark optional
 if benchmark_price_col is not None:
+    assert_in_df(df, benchmark_price_col, "Benchmark Price (filtered)")
     ndf["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
     if benchmark_ret_col is not None:
+        assert_in_df(df, benchmark_ret_col, "Benchmark Return (filtered)")
         ndf["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
     else:
         ndf["Bench_Return"] = ndf["Bench_Price"].pct_change()
     auto_pct_b = detect_return_scale(ndf["Bench_Return"])
     with st.sidebar.expander("Benchmark Return Scaling"):
-        force_pct_b = st.checkbox("Treat Benchmark Return column as % (divide by 100)", value=auto_pct_b, key="bench_pct_flag")
-    if st.session_state.get("bench_pct_flag", False):
+        st.checkbox("Treat Benchmark Return column as % (divide by 100)",
+                    value=auto_pct_b,
+                    key=file_scope_key("bench_pct_flag", uploaded_file))
+    if st.session_state.get(file_scope_key("bench_pct_flag", uploaded_file), False):
         ndf["Bench_Return"] = ndf["Bench_Return"] / 100.0
 else:
     ndf["Bench_Price"] = np.nan
@@ -297,7 +328,7 @@ else:
 # ======================================
 st.header("1️⃣ Performance Analysis")
 
-df_reset = reset_with_date_index(ndf)
+df_reset = reset_with_date(ndf)
 
 price_cols = ["Asset_Price"] + (["Bench_Price"] if ndf["Bench_Price"].notna().any() else [])
 rename_map = {"Asset_Price": asset_name}
@@ -310,7 +341,6 @@ fig1 = px.line(
     y=price_cols,
     title=f"{asset_name}" + (f" vs {bench_name}" if "Bench_Price" in price_cols else "") + " — Prices"
 )
-# Apply display names
 for tr in fig1.data:
     tr.name = rename_map.get(tr.name, tr.name)
 st.plotly_chart(fig1, width='stretch')
@@ -333,7 +363,7 @@ stats_tbl = ndf[stats_cols].agg(["mean", "var", "std"]).rename(
     columns={"Asset_Return": asset_name, "Bench_Return": bench_name or "Benchmark"}
 )
 st.write("**Return Stats (daily):**")
-st.dataframe(stats_tbl, use_container_width=True)  # dataframe supports use_container_width
+st.dataframe(stats_tbl, use_container_width=True)
 
 diag = pd.DataFrame({
     "Metric": ["Mean (daily)", "Std (daily)", "Min", "Max"],
@@ -409,12 +439,16 @@ st.header("4️⃣ Black–Scholes Calculation")
 col1, col2 = st.columns(2)
 with col1:
     last_price = ndf["Asset_Price"].dropna().iloc[-1] if ndf["Asset_Price"].dropna().size else 100.0
-    S = st.number_input("Spot Price", min_value=0.0, value=float(last_price))
-    K = st.number_input("Strike Price", min_value=0.0, value=float(last_price))
+    S = st.number_input("Spot Price", min_value=0.0, value=float(last_price),
+                        key=file_scope_key("bs_S", uploaded_file))
+    K = st.number_input("Strike Price", min_value=0.0, value=float(last_price),
+                        key=file_scope_key("bs_K", uploaded_file))
 with col2:
-    sigma_ui = st.number_input("Volatility (σ, decimal)", min_value=0.0, value=0.2)
-    T = st.number_input("Time to Maturity (Years)", min_value=0.0, value=1.0)
-opt_type = st.selectbox("Option Type", ["call", "put"])
+    sigma_ui = st.number_input("Volatility (σ, decimal)", min_value=0.0, value=0.2,
+                               key=file_scope_key("bs_sigma", uploaded_file))
+    T = st.number_input("Time to Maturity (Years)", min_value=0.0, value=1.0,
+                        key=file_scope_key("bs_T", uploaded_file))
+opt_type = st.selectbox("Option Type", ["call", "put"], key=file_scope_key("bs_type", uploaded_file))
 price, delta, gamma, theta, vega, rho = black_scholes(S, K, risk_free, sigma_ui, T, option_type=opt_type)
 st.write(f"**Price:** {price:.4f} | **Delta:** {delta:.4f} | **Gamma:** {gamma:.6f} | "
          f"**Theta:** {theta:.4f} | **Vega:** {vega:.4f} | **Rho:** {rho:.4f}")
@@ -431,26 +465,28 @@ with tab_direct:
     with colA:
         A = st.number_input("Total Rate-Sensitive Assets A", min_value=0.0,
                             value=st.session_state.get("alm_A", 1_000_000_000.0),
-                            step=1_000_000.0, format="%.2f", key="alm_A_input")
+                            step=1_000_000.0, format="%.2f", key=file_scope_key("alm_A", uploaded_file))
         DA = st.number_input("Duration of Assets DA (years)", min_value=0.0,
                              value=st.session_state.get("alm_DA", 2.0),
-                             step=0.1, format="%.2f", key="alm_DA_input")
+                             step=0.1, format="%.2f", key=file_scope_key("alm_DA", uploaded_file))
         CA = st.number_input("Convexity of Assets CA (optional)", min_value=0.0,
                              value=st.session_state.get("alm_CA", 0.0),
-                             step=0.1, format="%.4f", key="alm_CA_input")
+                             step=0.1, format="%.4f", key=file_scope_key("alm_CA", uploaded_file))
     with colB:
         L = st.number_input("Total Rate-Sensitive Liabilities L", min_value=0.0,
                             value=st.session_state.get("alm_L", 900_000_000.0),
-                            step=1_000_000.0, format="%.2f", key="alm_L_input")
+                            step=1_000_000.0, format="%.2f", key=file_scope_key("alm_L", uploaded_file))
         DL = st.number_input("Duration of Liabilities DL (years)", min_value=0.0,
                              value=st.session_state.get("alm_DL", 1.5),
-                             step=0.1, format="%.2f", key="alm_DL_input")
+                             step=0.1, format="%.2f", key=file_scope_key("alm_DL", uploaded_file))
         CL = st.number_input("Convexity of Liabilities CL (optional)", min_value=0.0,
                              value=st.session_state.get("alm_CL", 0.0),
-                             step=0.1, format="%.4f", key="alm_CL_input")
+                             step=0.1, format="%.4f", key=file_scope_key("alm_CL", uploaded_file))
     with colC:
-        shock_mode = st.radio("Shock Input", ["Basis Points (bps)", "Percent (%)"], horizontal=True, key="alm_mode")
-        shock_val = st.number_input("Parallel Yield Shock", value=100.0, step=25.0, format="%.2f", key="alm_shock")
+        shock_mode = st.radio("Shock Input", ["Basis Points (bps)", "Percent (%)"],
+                              horizontal=True, key=file_scope_key("alm_mode", uploaded_file))
+        shock_val = st.number_input("Parallel Yield Shock", value=100.0, step=25.0, format="%.2f",
+                                    key=file_scope_key("alm_shock", uploaded_file))
         dy = shock_val/10000.0 if shock_mode == "Basis Points (bps)" else shock_val/100.0
 
     E = A - L
@@ -470,8 +506,9 @@ with tab_direct:
     with c3: st.metric("Δy", f"{dy:.4%}");               st.metric("Equity Shock (%)", f"{(shock_pct if not np.isnan(shock_pct) else 0):.2f}%")
     st.write(f"**ΔE (amount):** {dE_total:,.2f} | **Linear:** {0.0 if np.isnan(dE_linear) else dE_linear:,.2f} | **Convexity:** {dE_conv:,.2f}")
 
-    st.subheader("ΔEVE Sensitivity: Equity Shock vs Yield Shift")
-    step_bps = st.select_slider("Shock grid resolution (bps)", options=[10, 25, 50, 100], value=25)
+    st.subheader("ΔEVE Sensitivity: Equity Shock % vs Yield Shift (−300…+300 bps)")
+    step_bps = st.select_slider("Shock grid resolution (bps)", options=[10, 25, 50, 100], value=25,
+                                key=file_scope_key("alm_step", uploaded_file))
     shocks_bps = np.arange(-300, 300 + step_bps, step_bps, dtype=int)
     dy_vec = shocks_bps / 10000.0
     if not np.isnan(DG) and E != 0 and not np.isnan(E):
@@ -482,11 +519,9 @@ with tab_direct:
         sens_df = pd.DataFrame({
             "Shock_bps": shocks_bps,
             "Delta_y": dy_vec,
-            "DeltaE_amount": dE_total_vec,
             "EquityShock_pct": eq_shock_pct_vec
         })
-        st.dataframe(sens_df.style.format({"Delta_y": "{:.4%}", "DeltaE_amount": "{:,.2f}", "EquityShock_pct": "{:.2f}"}),
-                     use_container_width=True)
+        st.dataframe(sens_df.style.format({"Delta_y": "{:.4%}", "EquityShock_pct": "{:.2f}"}), use_container_width=True)
         fig_sens = px.line(sens_df, x="Shock_bps", y="EquityShock_pct",
                            title="Equity Shock % vs Parallel Yield Shift (bps)")
         fig_sens.update_traces(mode="lines+markers")
@@ -496,7 +531,7 @@ with tab_direct:
 
 with tab_csv:
     st.caption("Minimum columns: **Type** ∈ {Asset, Liability}, **Amount** (numeric). Optional: **Midpoint_Years** for duration.")
-    alm_file = st.file_uploader("Upload CSV", type=["csv"], key="alm_csv")
+    alm_file = st.file_uploader("Upload CSV", type=["csv"], key=file_scope_key("alm_csv", uploaded_file))
     if alm_file:
         alm_df = pd.read_csv(alm_file)
         st.dataframe(alm_df, use_container_width=True)
@@ -523,7 +558,7 @@ with tab_csv:
             st.write(f"**RSA (A):** {A_csv:,.2f} | **RSL (L):** {L_csv:,.2f}")
             st.write(f"**Estimated DA (years):** {DA_csv:.4f}" if not np.isnan(DA_csv) else "**Estimated DA:** —")
             st.write(f"**Estimated DL (years):** {DL_csv:.4f}" if not np.isnan(DL_csv) else "**Estimated DL:** —")
-            if st.button("Use these in Direct Input", type="primary"):
+            if st.button("Use these in Direct Input", type="primary", key=file_scope_key("alm_use_btn", uploaded_file)):
                 if not np.isnan(A_csv): st.session_state["alm_A"] = A_csv
                 if not np.isnan(L_csv): st.session_state["alm_L"] = L_csv
                 if not np.isnan(DA_csv): st.session_state["alm_DA"] = DA_csv
@@ -533,7 +568,7 @@ with tab_csv:
             st.info("CSV must include columns: Type, Amount. (Optional: Midpoint_Years).")
 
 # ======================================
-# 6) Portfolio Simulation (MC, consistent with VaR)
+# 6) Portfolio Simulation (MC aligned with VaR)
 # ======================================
 st.header("6️⃣ Portfolio Simulation")
 
@@ -541,11 +576,14 @@ log_r = np.log1p(ndf["Asset_Return"].dropna().values.astype(float))
 if log_r.size < 5 or np.isnan(log_r).all():
     st.info("Insufficient data to simulate returns.")
 else:
-    n_sims  = st.slider("Number of simulations", 1000, 100_000, 10_000, step=1000)
+    n_sims  = st.slider("Number of simulations", 1000, 100_000, 10_000, step=1000,
+                        key=file_scope_key("sim_n", uploaded_file))
     steps_y = int(np.ceil(252 * time_horizon))
-    seed_on = st.checkbox("Set random seed (reproducible)", value=False)
+    seed_on = st.checkbox("Set random seed (reproducible)", value=False,
+                          key=file_scope_key("sim_seed_on", uploaded_file))
     if seed_on:
-        seed_val = st.number_input("Seed", min_value=0, value=42, step=1)
+        seed_val = st.number_input("Seed", min_value=0, value=42, step=1,
+                                   key=file_scope_key("sim_seed", uploaded_file))
         np.random.seed(int(seed_val))
 
     mu_log_d = float(np.nanmean(log_r))
