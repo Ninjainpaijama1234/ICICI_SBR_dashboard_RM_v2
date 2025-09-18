@@ -89,33 +89,67 @@ def black_scholes(S, K, r, sigma, T, option_type="call"):
         return (np.nan,)*6
 
 # ----------------------------
-# VaR helpers
+# VaR helpers (PERCENT, horizon-aware)
 # ----------------------------
-def historical_var(returns, conf=0.95):
-    r = pd.Series(returns).dropna().values
-    return np.nan if r.size == 0 else np.percentile(r, (1 - conf) * 100)
+def _rolling_compounded(returns: pd.Series, window_days: int) -> np.ndarray:
+    """Compounded simple returns over rolling window; returns array of horizon returns."""
+    r = pd.Series(returns).dropna().astype(float)
+    if r.empty:
+        return np.array([])
+    if window_days <= 1:
+        return r.values
+    comp = (1.0 + r).rolling(window_days).apply(np.prod, raw=True) - 1.0
+    return comp.dropna().values
 
-def parametric_var(returns, conf=0.95):
-    r = pd.Series(returns).dropna().values
+def hist_var_pct(returns, conf=0.95, horizon_days=1):
+    """
+    Historical VaR as POSITIVE LOSS PERCENT over horizon_days.
+    VaR% = -quantile_{1-conf}(horizon return distribution)
+    """
+    horizon_rets = _rolling_compounded(pd.Series(returns), max(1, int(horizon_days)))
+    if horizon_rets.size == 0:
+        return np.nan
+    q = np.percentile(horizon_rets, (1 - conf) * 100.0)
+    return max(0.0, -q)
+
+def parametric_var_pct(returns, conf=0.95, horizon_days=1):
+    """
+    Parametric VaR (Normal) as POSITIVE LOSS PERCENT over horizon_days.
+    Uses mean_daily, std_daily scaled: mu_H = mu_d*n, sig_H = sig_d*sqrt(n)
+    VaR% = -(mu_H + sig_H * z_{1-conf})
+    """
+    r = pd.Series(returns).dropna().astype(float).values
     if r.size == 0:
         return np.nan
-    mu, sigma = r.mean(), r.std(ddof=1)
-    if np.isnan(mu) or np.isnan(sigma):
+    n = max(1, int(horizon_days))
+    mu_d, sig_d = r.mean(), r.std(ddof=1)
+    if np.isnan(mu_d) or np.isnan(sig_d):
         return np.nan
-    return mu - sigma * sps.norm.ppf(conf)
+    mu_H = mu_d * n
+    sig_H = sig_d * np.sqrt(n)
+    q = mu_H + sig_H * sps.norm.ppf(1 - conf)  # left-tail quantile
+    return max(0.0, -q)
 
-def monte_carlo_var(S0, mu, sigma, T, n=10000, conf=0.95):
-    """One-step lognormal approximation for VaR section."""
-    try:
-        S0 = float(S0); mu = float(mu); sigma = float(sigma); T = float(T)
-        if S0 <= 0 or sigma < 0 or T <= 0 or n <= 10:
-            return np.nan
-        sims = S0 * np.exp((mu - 0.5 * sigma**2) * T +
-                           sigma * np.sqrt(T) * np.random.randn(int(n)))
-        rets = (sims - S0) / S0
-        return np.nan if rets.size == 0 else np.percentile(rets, (1 - conf) * 100)
-    except Exception:
+def mc_var_pct_from_returns(returns, conf=0.95, horizon_days=1, n=10000, seed=None):
+    """
+    Monte Carlo VaR using DAILY LOG-RETURN calibration.
+    Simulate horizon_days using one-step lognormal with log-mean/vol scaled to horizon.
+    VaR% = -quantile_{1-conf}(simulated horizon return)
+    """
+    r = pd.Series(returns).dropna().astype(float).values
+    if r.size == 0 or n < 100:
         return np.nan
+    if seed is not None:
+        np.random.seed(int(seed))
+    log_r = np.log1p(r)
+    mu_log_d = np.nanmean(log_r)
+    sig_log_d = np.nanstd(log_r, ddof=1)
+    H = max(1, int(horizon_days))
+    mu_H = mu_log_d * H
+    sig_H = sig_log_d * np.sqrt(H)
+    sims = np.exp(mu_H + sig_H * np.random.randn(int(n))) - 1.0
+    q = np.percentile(sims, (1 - conf) * 100.0)
+    return max(0.0, -q)
 
 # ----------------------------
 # App
@@ -313,28 +347,21 @@ else:
     st.info("No benchmark selected/provided → skipping Alpha/Beta.")
 
 # ==========================
-# 3) VaR (Asset)
+# 3) VaR (Asset) — PERCENT ONLY, horizon-aware
 # ==========================
-st.header("3️⃣ Value at Risk (VaR) — on Asset")
+st.header("3️⃣ Value at Risk (VaR) — Percent Loss (no amounts)")
 
-hist_var_val = historical_var(ndf["Asset_Return"], conf)
-param_var_val = parametric_var(ndf["Asset_Return"], conf)
-last_price = ndf["Asset_Price"].dropna().iloc[-1] if ndf["Asset_Price"].dropna().size else np.nan
-mc_var_val = monte_carlo_var(
-    S0=last_price,
-    mu=safe_mean(ndf["Asset_Return"]),
-    sigma=safe_std(ndf["Asset_Return"]),
-    T=time_horizon, n=10000, conf=conf
-)
+# Horizon in trading days
+h_days = max(1, int(round(252 * float(time_horizon))))
 
-st.write(f"**Confidence:** {int(conf*100)}%")
-st.write(f"**Historical VaR (return):** {hist_var_val:.2%}")
-st.write(f"**Parametric VaR (return):** {param_var_val:.2%}")
-st.write(f"**Monte Carlo VaR (return over {time_horizon:.2f}y):** {mc_var_val:.2%}")
-if notional and not np.isnan(notional):
-    st.write(f"**Historical VaR (amt):** {notional * hist_var_val:,.2f}")
-    st.write(f"**Parametric VaR (amt):** {notional * param_var_val:,.2f}")
-    st.write(f"**Monte Carlo VaR (amt):** {notional * mc_var_val:,.2f}")
+hist_var_percent = hist_var_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
+para_var_percent = parametric_var_pct(ndf["Asset_Return"], conf=conf, horizon_days=h_days)
+mc_var_percent   = mc_var_pct_from_returns(ndf["Asset_Return"], conf=conf, horizon_days=h_days, n=10000)
+
+st.caption(f"Holding period: {h_days} trading day(s) | Confidence: {int(conf*100)}%")
+st.write(f"**Historical VaR (loss):** {hist_var_percent:.2%}")
+st.write(f"**Parametric VaR (loss):** {para_var_percent:.2%}")
+st.write(f"**Monte Carlo VaR (loss):** {mc_var_percent:.2%}")
 
 # ==========================
 # 4) Options & Greeks
@@ -342,8 +369,9 @@ if notional and not np.isnan(notional):
 st.header("4️⃣ Options & Greeks")
 col1, col2 = st.columns(2)
 with col1:
-    S = st.number_input("Spot Price", min_value=0.0, value=float(last_price) if not np.isnan(last_price) else 100.0)
-    K = st.number_input("Strike Price", min_value=0.0, value=float(last_price) if not np.isnan(last_price) else 100.0)
+    last_price = ndf["Asset_Price"].dropna().iloc[-1] if ndf["Asset_Price"].dropna().size else 100.0
+    S = st.number_input("Spot Price", min_value=0.0, value=float(last_price))
+    K = st.number_input("Strike Price", min_value=0.0, value=float(last_price))
 with col2:
     sigma_ui = st.number_input("Volatility (σ, decimal)", min_value=0.0, value=0.2)
     T = st.number_input("Time to Maturity (Years)", min_value=0.0, value=1.0)
@@ -467,7 +495,7 @@ with tab_csv:
             st.info("CSV must include columns: Type, Amount. (Optional: Midpoint_Years).")
 
 # ==========================
-# 6) Monte Carlo (GBM) on Asset
+# 6) Portfolio Simulation (unchanged view)
 # ==========================
 st.header("6️⃣ Portfolio Simulation")
 
@@ -501,9 +529,6 @@ else:
     st.write(f"**Confidence:** {int(conf*100)}%")
     st.write(f"**Probability of Loss over horizon:** {prob_loss:.2%}")
     st.write(f"**Mean Terminal Return:** {mean_ret:.2%} | **Median:** {p50:.2%} | **5th pct:** {p5:.2%} | **95th pct:** {p95:.2%}")
-    if notional and not np.isnan(notional):
-        st.write(f"**VaR (amount, horizon):** {notional * var_horizon:,.2f}")
-        st.write(f"**Mean P&L (amount, horizon):** {notional * mean_ret:,.2f}")
 
 # ==========================
 # 7) Download
