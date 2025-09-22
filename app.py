@@ -65,29 +65,19 @@ def assert_in_df(df: pd.DataFrame, col: str | None, label: str):
         st.error(f"❌ {label} column not found: `{col}`.\n\n**Available columns:** {list(df.columns)}")
         st.stop()
 
-def clamp_pct(x):
-    if x is None or np.isnan(x):
-        return np.nan
-    return float(np.minimum(1.0, np.maximum(0.0, x)))
-
 def detect_return_scale(r: pd.Series) -> bool:
     r = pd.to_numeric(pd.Series(r).dropna(), errors="coerce")
     if r.empty:
         return False
     med_abs = float(np.median(np.abs(r)))
     max_abs = float(np.max(np.abs(r)))
-    if (0.5 <= med_abs <= 100) or (2 < max_abs < 200):
-        return True
-    return False
+    return (0.5 <= med_abs <= 100) or (2 < max_abs < 200)
 
 def reset_with_date(frame: pd.DataFrame) -> pd.DataFrame:
     tmp = frame.reset_index()
     dt_candidates = [c for c in tmp.columns if pd.api.types.is_datetime64_any_dtype(tmp[c])]
-    if dt_candidates:
-        dcol = dt_candidates[0]
-    else:
-        dcol = tmp.columns[0]
-        tmp[dcol] = pd.to_datetime(tmp[dcol], errors="coerce")
+    dcol = dt_candidates[0] if dt_candidates else tmp.columns[0]
+    tmp[dcol] = pd.to_datetime(tmp[dcol], errors="coerce")
     if dcol != "Date":
         tmp = tmp.rename(columns={dcol: "Date"})
     return tmp
@@ -101,8 +91,7 @@ def guess_date_col(df: pd.DataFrame) -> str:
             return c
     best_c, best_score = None, -1
     for c in df.columns:
-        s = pd.to_datetime(df[c], errors="coerce")
-        score = s.notna().sum()
+        score = pd.to_datetime(df[c], errors="coerce").notna().sum()
         if score > best_score:
             best_c, best_score = c, score
     return best_c or df.columns[0]
@@ -120,6 +109,11 @@ def first_numeric(cols, df):
         if is_numeric_series(df[c]):
             return c
     return None
+
+def clamp_pct(x):
+    if x is None or np.isnan(x):
+        return np.nan
+    return float(np.minimum(1.0, np.maximum(0.0, x)))
 
 # ======================================
 # Black–Scholes
@@ -148,50 +142,37 @@ def black_scholes(S, K, r, sigma, T, option_type="call"):
         return (np.nan,)*6
 
 # ======================================
-# VaR helpers (YOUR SPEC)
+# VaR helpers (per your spec)
 # ======================================
 def k_from_conf(conf: float) -> float:
-    # left-tail percentile k
-    if conf >= 0.99:
-        return 0.01
-    if conf >= 0.95:
-        return 0.05
-    return 0.10  # for 90%
+    if conf >= 0.99: return 0.01
+    if conf >= 0.95: return 0.05
+    return 0.10
 
 def z_from_conf(conf: float) -> float:
-    # use your requested Z approximations
-    if conf >= 0.99:
-        return 2.33
-    if conf >= 0.95:
-        return 1.65
-    return 1.28  # for 90%
+    if conf >= 0.99: return 2.33
+    if conf >= 0.95: return 1.65
+    return 1.28
 
 def historical_var_pct_daily(returns: pd.Series, conf: float) -> float:
     r = pd.Series(returns).dropna().astype(float).values
-    if r.size == 0:
-        return np.nan
+    if r.size == 0: return np.nan
     k = k_from_conf(conf) * 100.0
-    q = np.percentile(r, k)  # k-th percentile (left tail)
+    q = np.percentile(r, k)
     return clamp_pct(max(0.0, -q))
 
 def analytical_var_pct_daily(returns: pd.Series, conf: float) -> float:
     r = pd.Series(returns).dropna().astype(float).values
-    if r.size == 0:
-        return np.nan
+    if r.size == 0: return np.nan
     z = z_from_conf(conf)
     sd = float(np.nanstd(r, ddof=1))
-    var = z * sd
-    return clamp_pct(max(0.0, var))
+    return clamp_pct(max(0.0, z * sd))
 
 def mc_var_pct_daily(returns: pd.Series, conf: float, n_sims: int, seed: int | None = None) -> float:
     r = pd.Series(returns).dropna().astype(float).values
-    if r.size == 0 or n_sims < 100:
-        return np.nan
-    if seed is not None:
-        np.random.seed(int(seed))
-    mu = float(np.nanmean(r))
-    sd = float(np.nanstd(r, ddof=1))
-    # simulate via inverse-normal (equivalent to Excel NORM.INV on U(0,1))
+    if r.size == 0 or n_sims < 100: return np.nan
+    if seed is not None: np.random.seed(int(seed))
+    mu = float(np.nanmean(r)); sd = float(np.nanstd(r, ddof=1))
     u = np.random.rand(int(n_sims))
     sims = sps.norm.ppf(u, loc=mu, scale=sd)
     k = k_from_conf(conf) * 100.0
@@ -209,18 +190,15 @@ def load_data(uploaded_file) -> Tuple[pd.DataFrame, str, bool]:
             xls = pd.ExcelFile(uploaded_file)
             return pd.read_excel(xls, sheet_name=xls.sheet_names[0]), uploaded_file.name.split(".")[0], False
         except Exception as e:
-            st.error(f"Failed to read the uploaded workbook: {e}")
-            st.stop()
+            st.error(f"Failed to read the uploaded workbook: {e}"); st.stop()
     else:
         try:
             df = pd.read_excel(DEFAULT_FILE)
             return df, "ICICI", True
         except FileNotFoundError:
-            st.error(f"Default dataset `{DEFAULT_FILE}` not found. Add it to the repo or upload a workbook.")
-            st.stop()
+            st.error(f"Default dataset `{DEFAULT_FILE}` not found. Add it to the repo or upload a workbook."); st.stop()
         except Exception as e:
-            st.error(f"Failed to read `{DEFAULT_FILE}`: {e}")
-            st.stop()
+            st.error(f"Failed to read `{DEFAULT_FILE}`: {e}"); st.stop()
 
 # ======================================
 # App
@@ -232,7 +210,7 @@ st.title("📊 Risk & Portfolio Dashboard")
 uploaded_file = st.file_uploader("Upload Excel (any stock + optional benchmark)", type=["xlsx"])
 raw, default_name_asset, using_default = load_data(uploaded_file)
 
-# If uploaded has multiple sheets, allow selection (still only the uploaded file)
+# If uploaded has multiple sheets, allow selection
 if uploaded_file:
     try:
         xls = pd.ExcelFile(uploaded_file)
@@ -241,8 +219,7 @@ if uploaded_file:
                                          key=file_scope_key("sheet", uploaded_file))
             raw = pd.read_excel(xls, sheet_name=sheet)
     except Exception as e:
-        st.error(f"Failed to enumerate sheets: {e}")
-        st.stop()
+        st.error(f"Failed to enumerate sheets: {e}"); st.stop()
 
 # Normalize column names
 raw.columns = normalize_cols(raw.columns)
@@ -334,54 +311,39 @@ if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
 else:
     st.warning("Invalid date range; using full data.")
 if df.empty:
-    st.warning("No data in the selected range. Adjust filters.")
-    st.stop()
+    st.warning("No data in the selected range. Adjust filters."); st.stop()
 
 st.sidebar.subheader("Global Parameters")
 risk_free = st.sidebar.slider("Risk-Free Rate (%)", 0.0, 10.0, 5.0,
                               key=file_scope_key("rf", uploaded_file)) / 100.0
-volatility_ui = st.sidebar.slider("Volatility (%)", 0.0, 100.0, 30.0,
-                                  key=file_scope_key("vol_ui", uploaded_file)) / 100.0
-time_horizon = st.sidebar.slider("Time Horizon (Years)", 0.1, 5.0, 1.0,
+time_horizon = st.sidebar.slider("Time Horizon (Years) [for terminal MC]", 0.1, 5.0, 1.0,
                                  key=file_scope_key("horizon", uploaded_file))
 conf = st.sidebar.select_slider("VaR Confidence Level",
-                                options=[0.90, 0.95, 0.99],
-                                value=0.95,
+                                options=[0.90, 0.95, 0.99], value=0.95,
                                 key=file_scope_key("var_conf", uploaded_file),
                                 format_func=lambda x: f"{int(x*100)}%")
 
 # ---------- Working frame ----------
 ndf = pd.DataFrame(index=df.index)
-assert_in_df(df, asset_price_col, "Asset Price (filtered)")
 ndf["Asset_Price"] = pd.to_numeric(df[asset_price_col], errors="coerce")
-if asset_ret_col is not None:
-    assert_in_df(df, asset_ret_col, "Asset Return (filtered)")
-    ndf["Asset_Return"] = pd.to_numeric(df[asset_ret_col], errors="coerce")
-else:
-    ndf["Asset_Return"] = ndf["Asset_Price"].pct_change()
+ndf["Asset_Return"] = (pd.to_numeric(df[asset_ret_col], errors="coerce")
+                       if asset_ret_col is not None else ndf["Asset_Price"].pct_change())
 
 auto_pct = detect_return_scale(ndf["Asset_Return"])
-with st.sidebar.expander("Return Scaling (if uploaded returns are % units)"):
-    st.write("If return column uses % units (e.g., 1.2 = 1.2%), enable scaling.")
+with st.sidebar.expander("Return Scaling (Asset)"):
     st.checkbox("Treat Asset Return column as % (divide by 100)",
-                value=auto_pct,
-                key=file_scope_key("asset_pct_flag", uploaded_file))
+                value=auto_pct, key=file_scope_key("asset_pct_flag", uploaded_file))
 if st.session_state.get(file_scope_key("asset_pct_flag", uploaded_file), False):
     ndf["Asset_Return"] = ndf["Asset_Return"] / 100.0
 
 if benchmark_price_col is not None:
-    assert_in_df(df, benchmark_price_col, "Benchmark Price (filtered)")
     ndf["Bench_Price"] = pd.to_numeric(df[benchmark_price_col], errors="coerce")
-    if benchmark_ret_col is not None:
-        assert_in_df(df, benchmark_ret_col, "Benchmark Return (filtered)")
-        ndf["Bench_Return"] = pd.to_numeric(df[benchmark_ret_col], errors="coerce")
-    else:
-        ndf["Bench_Return"] = ndf["Bench_Price"].pct_change()
+    ndf["Bench_Return"] = (pd.to_numeric(df[benchmark_ret_col], errors="coerce")
+                           if benchmark_ret_col is not None else ndf["Bench_Price"].pct_change())
     auto_pct_b = detect_return_scale(ndf["Bench_Return"])
-    with st.sidebar.expander("Benchmark Return Scaling"):
+    with st.sidebar.expander("Return Scaling (Benchmark)"):
         st.checkbox("Treat Benchmark Return column as % (divide by 100)",
-                    value=auto_pct_b,
-                    key=file_scope_key("bench_pct_flag", uploaded_file))
+                    value=auto_pct_b, key=file_scope_key("bench_pct_flag", uploaded_file))
     if st.session_state.get(file_scope_key("bench_pct_flag", uploaded_file), False):
         ndf["Bench_Return"] = ndf["Bench_Return"] / 100.0
 else:
@@ -394,16 +356,12 @@ else:
 st.header("1️⃣ Performance Analysis")
 
 df_reset = reset_with_date(ndf)
-
 price_cols = ["Asset_Price"] + (["Bench_Price"] if ndf["Bench_Price"].notna().any() else [])
 rename_map = {"Asset_Price": asset_name}
-if "Bench_Price" in price_cols:
-    rename_map["Bench_Price"] = bench_name or "Benchmark"
+if "Bench_Price" in price_cols: rename_map["Bench_Price"] = bench_name or "Benchmark"
 
-fig1 = px.line(
-    df_reset, x="Date", y=price_cols,
-    title=f"{asset_name}" + (f" vs {bench_name}" if "Bench_Price" in price_cols else "") + " — Prices"
-)
+fig1 = px.line(df_reset, x="Date", y=price_cols,
+               title=f"{asset_name}" + (f" vs {bench_name}" if "Bench_Price" in price_cols else "") + " — Prices")
 for tr in fig1.data:
     tr.name = rename_map.get(tr.name, tr.name)
 st.plotly_chart(fig1, use_container_width=True)
@@ -412,31 +370,38 @@ cum_df = pd.DataFrame({"Date": df_reset["Date"]})
 cum_df[f"{asset_name}_CumRet"] = (1 + ndf["Asset_Return"].fillna(0)).cumprod().values - 1
 if ndf["Bench_Return"].notna().any():
     cum_df[f"{bench_name or 'Benchmark'}_CumRet"] = (1 + ndf["Bench_Return"].fillna(0)).cumprod().values - 1
-
-fig_cum = px.line(
-    cum_df, x="Date", y=[c for c in cum_df.columns if c.endswith("_CumRet")],
-    title="Cumulative Returns"
-)
+fig_cum = px.line(cum_df, x="Date", y=[c for c in cum_df.columns if c.endswith("_CumRet")], title="Cumulative Returns")
 st.plotly_chart(fig_cum, use_container_width=True)
 
-stats_cols = ["Asset_Return"] + (["Bench_Return"] if ndf["Bench_Return"].notna().any() else [])
-stats_tbl = ndf[stats_cols].agg(["mean", "var", "std"]).rename(
-    columns={"Asset_Return": asset_name, "Bench_Return": bench_name or "Benchmark"}
-)
-st.write("**Return Stats (daily):**")
-st.dataframe(stats_tbl, use_container_width=True)
-
-diag = pd.DataFrame({
+# ==== Return diagnostics (after scaling) for BOTH ====
+st.subheader("Return diagnostics (after scaling) — Asset & Benchmark")
+diag_asset = pd.DataFrame({
     "Metric": ["Mean (daily)", "Std (daily)", "Min", "Max"],
     "Value (%)": [
-        safe_mean(ndf["Asset_Return"]) * 100.0,
-        safe_std(ndf["Asset_Return"]) * 100.0,
-        pd.Series(ndf["Asset_Return"]).min() * 100.0,
-        pd.Series(ndf["Asset_Return"]).max() * 100.0,
+        safe_mean(ndf["Asset_Return"])*100.0,
+        safe_std(ndf["Asset_Return"])*100.0,
+        pd.Series(ndf["Asset_Return"]).min()*100.0,
+        pd.Series(ndf["Asset_Return"]).max()*100.0
     ]
 })
-st.caption("Return diagnostics (after scaling):")
-st.dataframe(diag.style.format({"Value (%)": "{:.4f}"}), use_container_width=True)
+cols = st.columns(2)
+with cols[0]:
+    st.markdown(f"**{asset_name}**")
+    st.dataframe(diag_asset.style.format({"Value (%)":"{:.4f}"}), use_container_width=True)
+
+if ndf["Bench_Return"].notna().sum() > 0:
+    diag_bench = pd.DataFrame({
+        "Metric": ["Mean (daily)", "Std (daily)", "Min", "Max"],
+        "Value (%)": [
+            safe_mean(ndf["Bench_Return"])*100.0,
+            safe_std(ndf["Bench_Return"])*100.0,
+            pd.Series(ndf["Bench_Return"]).min()*100.0,
+            pd.Series(ndf["Bench_Return"]).max()*100.0
+        ]
+    })
+    with cols[1]:
+        st.markdown(f"**{bench_name or 'Benchmark'}**")
+        st.dataframe(diag_bench.style.format({"Value (%)":"{:.4f}"}), use_container_width=True)
 
 # ======================================
 # 2) Risk–Return
@@ -459,10 +424,8 @@ if ndf["Bench_Return"].notna().sum() > 5:
             model = OLS(y, X).fit()
             alpha, beta = float(model.params[0]), float(model.params[1])
             st.write(f"**Alpha ({asset_name} vs {bench_name or 'Benchmark'}):** {alpha:.6f} | **Beta:** {beta:.4f}")
-            fig2 = px.scatter(
-                reg_df.reset_index(), x="Bench_Return", y="Asset_Return", trendline="ols",
-                title=f"Regression: {asset_name} vs {bench_name or 'Benchmark'} (daily returns)"
-            )
+            fig2 = px.scatter(reg_df.reset_index(), x="Bench_Return", y="Asset_Return", trendline="ols",
+                              title=f"Regression: {asset_name} vs {bench_name or 'Benchmark'} (daily returns)")
             st.plotly_chart(fig2, use_container_width=True)
         except Exception as e:
             st.warning(f"Regression failed: {e}")
@@ -472,40 +435,32 @@ else:
     st.info("No benchmark selected/provided → skipping Alpha/Beta.")
 
 # ======================================
-# 3) VaR — YOUR SPEC (Historical / Analytical / MC on daily change%)
+# 3) VaR — Daily Loss % (Historical | Analytical | Monte Carlo) — BOTH
 # ======================================
 st.header("3️⃣ Value at Risk (VaR) — Daily Loss % (Historical | Analytical | Monte Carlo)")
-
-# Choose simulation count here (for MC VaR)
 var_sims = st.slider("Monte Carlo simulations (for VaR)", 1_000, 200_000, 20_000, step=1_000,
                      key=file_scope_key("var_mc_sims", uploaded_file))
-set_seed = st.checkbox("Fix random seed for VaR MC", value=True,
-                       key=file_scope_key("var_mc_seed_on", uploaded_file))
-seed_val = 123 if set_seed else None
+seed_on = st.checkbox("Fix random seed (VaR MC)", value=True, key=file_scope_key("var_mc_seed_on", uploaded_file))
+seed_val = 123 if seed_on else None
+k = k_from_conf(conf); z_used = z_from_conf(conf)
 
-# Compute all three VaRs per your spec (daily horizon)
-hist_var_percent = historical_var_pct_daily(ndf["Asset_Return"], conf=conf)
-analyt_var_percent = analytical_var_pct_daily(ndf["Asset_Return"], conf=conf)
-mc_var_percent = mc_var_pct_daily(ndf["Asset_Return"], conf=conf, n_sims=var_sims, seed=seed_val)
+def var_panel(title, series):
+    colA, colB, colC = st.columns(3)
+    hv = historical_var_pct_daily(series, conf)
+    av = analytical_var_pct_daily(series, conf)
+    mv = mc_var_pct_daily(series, conf, n_sims=var_sims, seed=seed_val)
+    with colA: st.markdown("**Historical VaR**"); st.write(f"Loss VaR: {hv:.2%}")
+    with colB: st.markdown("**Analytical VaR (Z×SD)**"); st.write(f"Loss VaR: {av:.2%}  \n(Z≈{z_used:.2f})")
+    with colC: st.markdown("**Monte Carlo VaR (Normal μ,σ)**"); st.write(f"Loss VaR: {mv:.2%}")
+    st.caption(f"{title}: With **{int(conf*100)}% confidence** (k={int(k*100)}%), "
+               f"there’s a {int(k*100)}% chance daily loss ≥ VaR.")
 
-k = k_from_conf(conf)
-z_used = z_from_conf(conf)
-st.caption(
-    f"**Interpretation:** With **{int(conf*100)}% confidence** (k = {int(k*100)}%), "
-    f"there is a **{int(k*100)}%** chance the **daily** loss ≥ VaR.\n"
-    f"Analytical VaR uses **Z × SD** with Z ≈ {z_used:.2f}."
-)
+st.subheader(f"{asset_name}")
+var_panel(asset_name, ndf["Asset_Return"].dropna())
 
-colA, colB, colC = st.columns(3)
-with colA:
-    st.markdown("**Historical VaR**")
-    st.write(f"Loss VaR: {hist_var_percent:.2%}")
-with colB:
-    st.markdown("**Analytical VaR (Z × SD)**")
-    st.write(f"Loss VaR: {analyt_var_percent:.2%}")
-with colC:
-    st.markdown("**Monte Carlo VaR (Normal μ,σ)**")
-    st.write(f"Loss VaR: {mc_var_percent:.2%}")
+if ndf["Bench_Return"].notna().sum() > 5:
+    st.subheader(f"{bench_name or 'Benchmark'}")
+    var_panel(bench_name or "Benchmark", ndf["Bench_Return"].dropna())
 
 # ======================================
 # 4) Black–Scholes Calculation
@@ -558,11 +513,10 @@ with tab_direct:
                              value=st.session_state.get("alm_CL", 0.0),
                              step=0.1, format="%.4f", key=file_scope_key("alm_CL", uploaded_file))
     with colC:
-        shock_mode = st.radio("Shock Input", ["Basis Points (bps)", "Percent (%)"],
-                              horizontal=True, key=file_scope_key("alm_mode", uploaded_file))
-        shock_val = st.number_input("Parallel Yield Shock", value=100.0, step=25.0, format="%.2f",
-                                    key=file_scope_key("alm_shock", uploaded_file))
-        dy = shock_val/10000.0 if shock_mode == "Basis Points (bps)" else shock_val/100.0
+        shock_pct = st.number_input("Parallel Yield Shock (Percent, e.g., 1.00 for 1%)",
+                                    value=1.00, step=0.25, format="%.2f",
+                                    key=file_scope_key("alm_shock_pct", uploaded_file))
+        dy = float(shock_pct) / 100.0  # use percent input directly
 
     E = A - L
     A_safe = A if A > 0 else np.nan
@@ -572,33 +526,36 @@ with tab_direct:
     dE_linear = - DG * A * dy if not (np.isnan(DG) or np.isnan(dy)) else np.nan
     dE_conv = 0.5 * ((CA * A) - (CL * L)) * (dy**2) if (CA > 0 or CL > 0) else 0.0
     dE_total = (0.0 if np.isnan(dE_linear) else dE_linear) + dE_conv
-    shock_pct = (dE_total / E * 100.0) if E != 0 else np.nan
+    shock_equity_pct = (dE_total / E * 100.0) if E != 0 else np.nan
 
     st.markdown("DG = DA − DL × (L/A);  ΔE ≈ − DG × A × Δy  (+ convexity: 0.5 × (CA×A − CL×L) × Δy²)")
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Equity E = A − L", f"{E:,.2f}"); st.metric("DA (years)", f"{DA:.2f}")
     with c2: st.metric("DL (years)", f"{DL:.2f}");       st.metric("Duration Gap (DG)", f"{DG:.4f}" if not np.isnan(DG) else "—")
-    with c3: st.metric("Δy", f"{dy:.4%}");               st.metric("Equity Shock (%)", f"{(shock_pct if not np.isnan(shock_pct) else 0):.2f}%")
+    with c3: st.metric("Δy (Percent)", f"{dy*100:.2f}%"); st.metric("Equity Shock (%)", f"{(shock_equity_pct if not np.isnan(shock_equity_pct) else 0):.2f}%")
     st.write(f"**ΔE (amount):** {dE_total:,.2f} | **Linear:** {0.0 if np.isnan(dE_linear) else dE_linear:,.2f} | **Convexity:** {dE_conv:,.2f}")
 
-    st.subheader("ΔEVE Sensitivity: Equity Shock % vs Yield Shift (−300…+300 bps)")
-    step_bps = st.select_slider("Shock grid resolution (bps)", options=[10, 25, 50, 100], value=25,
-                                key=file_scope_key("alm_step", uploaded_file))
-    shocks_bps = np.arange(-300, 300 + step_bps, step_bps, dtype=int)
-    dy_vec = shocks_bps / 10000.0
+    # ---- ΔEVE Sensitivity: now in PERCENT shocks ----
+    st.subheader("ΔEVE Sensitivity: Equity Shock % vs Yield Shift (−3.00% … +3.00%)")
+    step_pct = st.select_slider("Shock grid resolution (percent)", options=[0.10, 0.25, 0.50, 1.00], value=0.25,
+                                key=file_scope_key("alm_step_pct", uploaded_file))
+    # Build grid in percent, convert to decimal Δy
+    shocks_pct = np.round(np.arange(-3.00, 3.00 + step_pct, step_pct), 2)
+    dy_vec = shocks_pct / 100.0
     if not np.isnan(DG) and E != 0 and not np.isnan(E):
         dE_linear_vec = -DG * A * dy_vec
         dE_conv_vec = 0.5 * ((CA * A) - (CL * L)) * (dy_vec ** 2) if (CA > 0 or CL > 0) else 0.0
         dE_total_vec = dE_linear_vec + dE_conv_vec
         eq_shock_pct_vec = (dE_total_vec / E) * 100.0
         sens_df = pd.DataFrame({
-            "Shock_bps": shocks_bps,
+            "Shock_%": shocks_pct,
             "Delta_y": dy_vec,
-            "EquityShock_pct": eq_shock_pct_vec
+            "EquityShock_%": eq_shock_pct_vec
         })
-        st.dataframe(sens_df.style.format({"Delta_y": "{:.4%}", "EquityShock_pct": "{:.2f}"}), use_container_width=True)
-        fig_sens = px.line(sens_df, x="Shock_bps", y="EquityShock_pct",
-                           title="Equity Shock % vs Parallel Yield Shift (bps)")
+        st.dataframe(sens_df.style.format({"Shock_%": "{:.2f}", "Delta_y": "{:.4%}", "EquityShock_%": "{:.2f}"}),
+                     use_container_width=True)
+        fig_sens = px.line(sens_df, x="Shock_%", y="EquityShock_%",
+                           title="Equity Shock % vs Parallel Yield Shift (%)")
         fig_sens.update_traces(mode="lines+markers")
         st.plotly_chart(fig_sens, use_container_width=True)
     else:
@@ -643,45 +600,44 @@ with tab_csv:
             st.info("CSV must include columns: Type, Amount. (Optional: Midpoint_Years).")
 
 # ======================================
-# 6) Portfolio Simulation (unchanged horizon-based terminal returns)
+# 6) Portfolio Simulation — BOTH (terminal horizon MC on log-returns)
 # ======================================
 st.header("6️⃣ Portfolio Simulation")
 
-log_r = np.log1p(ndf["Asset_Return"].dropna().values.astype(float))
-if log_r.size < 5 or np.isnan(log_r).all():
-    st.info("Insufficient data to simulate returns.")
-else:
-    n_sims  = st.slider("Number of simulations", 1000, 100_000, 10_000, step=1000,
-                        key=file_scope_key("sim_n", uploaded_file))
+tabs = st.tabs(([f"{asset_name}"] + ([f"{bench_name or 'Benchmark'}"] if ndf["Bench_Return"].notna().sum() > 5 else [])))
+
+def terminal_mc_panel(series, label):
+    log_r = np.log1p(series.dropna().values.astype(float))
+    if log_r.size < 5 or np.isnan(log_r).all():
+        st.info(f"Insufficient data to simulate returns for {label}."); return
+    n_sims  = st.slider(f"Number of simulations ({label})", 1000, 100_000, 10_000, step=1000,
+                        key=file_scope_key(f"sim_n_{label}", uploaded_file))
     steps_y = int(np.ceil(252 * time_horizon))
-    seed_on = st.checkbox("Set random seed (reproducible)", value=False,
-                          key=file_scope_key("sim_seed_on", uploaded_file))
+    seed_on = st.checkbox(f"Set random seed (reproducible) — {label}", value=False,
+                          key=file_scope_key(f"sim_seed_on_{label}", uploaded_file))
     if seed_on:
-        seed_val = st.number_input("Seed", min_value=0, value=42, step=1,
-                                   key=file_scope_key("sim_seed", uploaded_file))
+        seed_val = st.number_input(f"Seed — {label}", min_value=0, value=42, step=1,
+                                   key=file_scope_key(f"sim_seed_{label}", uploaded_file))
         np.random.seed(int(seed_val))
+    mu_log_d = float(np.nanmean(log_r)); sig_log_d = float(np.nanstd(log_r, ddof=1))
+    term = np.exp(mu_log_d * steps_y + sig_log_d * np.sqrt(steps_y) * np.random.randn(n_sims)) - 1.0
+    var_left = np.percentile(term, (1 - conf) * 100.0)
+    prob_loss = float((term < 0).mean())
+    mean_ret = float(np.mean(term)); p5, p50, p95 = np.percentile(term, [5, 50, 95])
+    sim_df = pd.DataFrame({"Terminal Return": term})
+    fig = px.histogram(sim_df, x="Terminal Return", nbins=60,
+                       title=f"{label}: Monte Carlo Terminal Return (Horizon = {time_horizon:.2f} yrs, {n_sims} paths)")
+    fig.add_vline(x=float(var_left), line_dash="dash", line_color="red",
+                  annotation_text=f"Left-tail {(1 - conf):.0%}", annotation_position="top right")
+    st.plotly_chart(fig, use_container_width=True)
+    st.write(f"**Probability of Loss:** {prob_loss:.2%}")
+    st.write(f"**Mean:** {mean_ret:.2%} | **Median:** {p50:.2%} | **5th pct:** {p5:.2%} | **95th pct:** {p95:.2%}")
 
-    mu_log_d = float(np.nanmean(log_r))
-    sig_log_d = float(np.nanstd(log_r, ddof=1))
-    term_returns = np.exp(mu_log_d * steps_y + sig_log_d * np.sqrt(steps_y) * np.random.randn(n_sims)) - 1.0
-
-    var_left = np.percentile(term_returns, (1 - conf) * 100.0)
-    prob_loss = float((term_returns < 0).mean())
-    mean_ret  = float(np.mean(term_returns))
-    p5, p50, p95 = np.percentile(term_returns, [5, 50, 95])
-
-    sim_df = pd.DataFrame({"Terminal Return": term_returns})
-    fig3 = px.histogram(
-        sim_df, x="Terminal Return", nbins=60,
-        title=f"Monte Carlo Terminal Return Distribution (Horizon = {time_horizon:.2f} yrs, {n_sims} paths)"
-    )
-    fig3.add_vline(x=float(var_left), line_dash="dash", line_color="red",
-                   annotation_text=f"Left-tail {(1 - conf):.0%}", annotation_position="top right")
-    st.plotly_chart(fig3, use_container_width=True)
-
-    st.caption(f"Monte Carlo left-tail uses (1 − Confidence). Confidence: {int(conf*100)}% → Left tail: {(1-conf):.0%}")
-    st.write(f"**Probability of Loss over horizon:** {prob_loss:.2%}")
-    st.write(f"**Mean Terminal Return:** {mean_ret:.2%} | **Median:** {p50:.2%} | **5th pct:** {p5:.2%} | **95th pct:** {p95:.2%}")
+with tabs[0]:
+    terminal_mc_panel(ndf["Asset_Return"], asset_name)
+if len(tabs) > 1:
+    with tabs[1]:
+        terminal_mc_panel(ndf["Bench_Return"], bench_name or "Benchmark")
 
 # ======================================
 # 7) Download
